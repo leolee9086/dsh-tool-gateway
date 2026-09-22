@@ -10,7 +10,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { apply, inject, name } from '../src/host.js'
-import { DENY_REASON } from '../src/gateway.js'
+import { denyReason } from '../src/gateway.js'
+
+/** PTC 没开着、也没有 PTC 运行时的部署里的拒绝理由（名单里就两个元工具）。 */
+const DENY_TWO = denyReason(new Set(['find_tools', 'call_tool']))
 
 /** 与 `@deepseek-ai/dsh-storage` 的 `UNIT_NAME_RE` 同一个正则。 */
 const UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/
@@ -42,8 +45,24 @@ function stubStorageDomain(records = new Map()) {
   }
 }
 
-/** 造一个够用的插件上下文桩。 */
-function stubCtx({ storage = undefined, agents = new Map(), withWeb = true } = {}) {
+/**
+ * 造一个够用的插件上下文桩。
+ *
+ * @param {object} [options] 覆盖项
+ * @param {object} [options.storage] storageDomain 桩
+ * @param {Map} [options.agents] 按 id 找会话
+ * @param {boolean} [options.withWeb] 有没有 webServer / connection
+ * @param {object} [options.ptcRuntime] PTC 运行时（缺省 = 这个部署没挂它）
+ * @param {Function} [options.schemas] 按 scope 返回工具 schema 列表
+ * @returns {object} 插件上下文桩
+ */
+function stubCtx({
+  storage = undefined,
+  agents = new Map(),
+  withWeb = true,
+  ptcRuntime = undefined,
+  schemas = () => [],
+} = {}) {
   const listeners = new Map()
   const registeredTools = []
   const guards = []
@@ -63,6 +82,7 @@ function stubCtx({ storage = undefined, agents = new Map(), withWeb = true } = {
     get(service) {
       if (service === 'storageDomain') return storage
       if (service === 'agents') return { get: (id) => (agents.has(id) ? { session: agents.get(id) } : undefined) }
+      if (service === 'ptcRuntime') return ptcRuntime
       if (service === 'webServer') {
         if (!withWeb) return undefined
         return {
@@ -89,7 +109,7 @@ function stubCtx({ storage = undefined, agents = new Map(), withWeb = true } = {
         registeredTools.push(definition)
         return () => {}
       },
-      schemas: () => [],
+      schemas: (scope) => schemas(scope),
       get: () => undefined,
       guard(fn) {
         guards.push(fn)
@@ -122,11 +142,12 @@ test('插件名与硬依赖服务', () => {
   assert.deepEqual([...inject].sort(), ['systemPrompt', 'tools'])
 })
 
-test('挂好之后：两个元工具、一个 assemble 监听器、一个守卫、一个提示段落、一条路由', async () => {
+test('挂好之后：三个元工具、一个 assemble 监听器、一个守卫、一个提示段落、一条路由', async () => {
   const ctx = stubCtx({ storage: stubStorageDomain() })
   await apply(ctx)
 
-  assert.deepEqual(ctx.registeredTools.map((tool) => tool.name).sort(), ['call_tool', 'find_tools'])
+  // 三个都无条件注册（apply 时没有 agent 上下文）；“该不该露面”是按 agent 判的。
+  assert.deepEqual(ctx.registeredTools.map((tool) => tool.name).sort(), ['call_tool', 'call_tools', 'find_tools'])
   assert.equal(typeof ctx.handlerOf('system-prompt/assemble'), 'function')
   assert.equal(ctx.guards.length, 1)
   assert.equal(ctx.sections.length, 1)
@@ -144,7 +165,7 @@ test('默认开：没有覆盖记录的会话照样被约束', async () => {
     {}, { agent: agentOf('session-a') }, async () => assemblyOf('find_tools', 'read', 'call_tool'),
   )
   assert.deepEqual(assembly.tools.map((tool) => tool.name), ['find_tools', 'call_tool'])
-  assert.equal(ctx.guards[0]({ name: 'read', agent: agentOf('session-a') }), DENY_REASON)
+  assert.equal(ctx.guards[0]({ name: 'read', agent: agentOf('session-a') }), DENY_TWO)
 })
 
 test('端到端：把一个会话关掉，只有它放开，别的会话不受影响', async () => {
@@ -166,7 +187,7 @@ test('端到端：把一个会话关掉，只有它放开，别的会话不受�
   assert.deepEqual(forB.tools.map((tool) => tool.name), ['find_tools', 'read', 'call_tool'])
 
   // 执行守卫
-  assert.equal(guard({ name: 'read', agent: agentA }), DENY_REASON)
+  assert.equal(guard({ name: 'read', agent: agentA }), DENY_TWO)
   assert.equal(guard({ name: 'read', agent: agentB }), undefined)
 
   // 提示段落
@@ -194,7 +215,7 @@ test('没有 webServer / connection 时不注册路由，但网关照常工作�
   await apply(ctx)
 
   assert.equal(ctx.routes.length, 0)
-  assert.equal(ctx.registeredTools.length, 2)
+  assert.equal(ctx.registeredTools.length, 3)
   assert.equal(ctx.guards.length, 1)
   assert.equal(ctx.warnings.length, 1)
   assert.match(ctx.warnings[0], /webServer/)
@@ -204,7 +225,7 @@ test('storage 用不了时仍然挂得起来，只是开关不持久', async () 
   const ctx = stubCtx({ storage: undefined })
   await apply(ctx)
 
-  assert.equal(ctx.registeredTools.length, 2)
+  assert.equal(ctx.registeredTools.length, 3)
   // storageDomain 缺席 → switch-state 自己降级并告警。
   assert.equal(ctx.warnings.length, 1)
   assert.match(ctx.warnings[0], /storageDomain/)
@@ -230,4 +251,92 @@ test('maxResults 配置会被 find_tools 用上（非法值回落到默认）', 
   // 空查询会直接返回提示，不碰 catalog —— 这里只证明配置没有把插件搞崩。
   const result = await findTools.execute({ query: '' }, { agent: agentOf('session-a') })
   assert.match(result.text, /query/)
+})
+
+/** 造一份工具 schema 列表（只要名字 —— host.js 的 PTC 检测只看名字）。 */
+function schemasOf(...names) {
+  return names.map((schemaName) => ({ name: schemaName }))
+}
+
+test('PTC 没开着时，第三个元工具也露面（这个部署挂了 PTC 运行时）', async () => {
+  const ctx = stubCtx({
+    storage: stubStorageDomain(),
+    ptcRuntime: { language: 'typescript' },
+    schemas: () => schemasOf('find_tools', 'read'),
+  })
+  await apply(ctx)
+
+  const assembly = await ctx.handlerOf('system-prompt/assemble')(
+    {}, { agent: agentOf('session-a') },
+    async () => assemblyOf('find_tools', 'call_tool', 'call_tools', 'read'),
+  )
+  assert.deepEqual(assembly.tools.map((tool) => tool.name), ['find_tools', 'call_tool', 'call_tools'])
+})
+
+test('PTC 已经开着时不加第三个元工具 —— 官方那个 run_code 就在表里了', async () => {
+  const ctx = stubCtx({
+    storage: stubStorageDomain(),
+    ptcRuntime: { language: 'typescript' },
+    schemas: () => schemasOf('run_code'),
+  })
+  await apply(ctx)
+
+  const target = agentOf('session-a')
+  const assembly = await ctx.handlerOf('system-prompt/assemble')(
+    {}, { agent: target },
+    async () => assemblyOf('find_tools', 'call_tool', 'call_tools', 'read'),
+  )
+  assert.deepEqual(assembly.tools.map((tool) => tool.name), ['find_tools', 'call_tool'])
+  // 守卫、提示段落与可见性三处保持一致：看不见的也调不到、也不提。
+  assert.equal(ctx.guards[0]({ name: 'call_tools', agent: target }), DENY_TWO)
+  assert.doesNotMatch(ctx.sections[0].text({ agent: target }), /call_tools/)
+})
+
+test('部署里没挂 PTC 运行时，第三个元工具不露面（露了也跑不了）', async () => {
+  const ctx = stubCtx({
+    storage: stubStorageDomain(),
+    schemas: () => schemasOf('find_tools', 'read'),
+  })
+  await apply(ctx)
+
+  const assembly = await ctx.handlerOf('system-prompt/assemble')(
+    {}, { agent: agentOf('session-a') },
+    async () => assemblyOf('find_tools', 'call_tool', 'call_tools'),
+  )
+  assert.deepEqual(assembly.tools.map((tool) => tool.name), ['find_tools', 'call_tool'])
+})
+
+test('PTC 检测读不出来时保守降级：不加第三个，也不让异常冒到装配外面', async () => {
+  const ctx = stubCtx({
+    storage: stubStorageDomain(),
+    ptcRuntime: { language: 'typescript' },
+    schemas: () => { throw new Error('注册表炸了') },
+  })
+  await apply(ctx)
+
+  const assembly = await ctx.handlerOf('system-prompt/assemble')(
+    {}, { agent: agentOf('session-a') },
+    async () => assemblyOf('find_tools', 'call_tool', 'call_tools'),
+  )
+  // “会话起不来”比“少一个工具”严重得多。
+  assert.deepEqual(assembly.tools.map((tool) => tool.name), ['find_tools', 'call_tool'])
+  assert.ok(ctx.warnings.some((warning) => /注册表炸了/.test(warning)))
+})
+
+test('PTC 状态是按 agent 算的，不是全局算一次', async () => {
+  // 同一个进程里两个会话：一个在 PTC 模式（可见集里有 run_code），一个不在。
+  const ptcAgent = agentOf('ptc-1')
+  const nativeAgent = agentOf('native-1')
+  const ctx = stubCtx({
+    storage: stubStorageDomain(),
+    ptcRuntime: { language: 'typescript' },
+    schemas: (scope) => (scope === ptcAgent ? schemasOf('run_code') : schemasOf('find_tools')),
+  })
+  await apply(ctx)
+
+  const assemble = ctx.handlerOf('system-prompt/assemble')
+  const forPtc = await assemble({}, { agent: ptcAgent }, async () => assemblyOf('find_tools', 'call_tool', 'call_tools'))
+  const forNative = await assemble({}, { agent: nativeAgent }, async () => assemblyOf('find_tools', 'call_tool', 'call_tools'))
+  assert.deepEqual(forPtc.tools.map((tool) => tool.name), ['find_tools', 'call_tool'])
+  assert.deepEqual(forNative.tools.map((tool) => tool.name), ['find_tools', 'call_tool', 'call_tools'])
 })

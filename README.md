@@ -1,7 +1,7 @@
 # dsh-tool-gateway
 
-把 DSH 的工具目录收成两个元工具：**`find_tools` 查、`call_tool` 调**。
-其余工具不出现在模型可见的工具表里，但**仍然可以被调用** —— 只是入口变成了这两个。
+把 DSH 的工具目录收成**三个元工具**：**`find_tools` 查、`call_tool` 调、`call_tools` 批量调**。
+其余工具不出现在模型可见的工具表里，但**仍然可以被调用** —— 只是入口变成了这几个。
 
 ## 它解决什么
 
@@ -10,6 +10,37 @@
 
 这个插件把工具目录收起来，逼出"**每一次动手之前先查清楚有什么**"这个动作：
 那份长列表不在眼前了，模型只能先 `find_tools` 问、再 `call_tool` 调。
+
+## 三个元工具
+
+| 工具 | 干什么 | 什么时候用 |
+|---|---|---|
+| `find_tools` | 按名字、描述、中文或拼音检索，返回完整参数 schema | 不知道有什么工具、或不知道参数怎么写 |
+| `call_tool` | 调一个工具，参数 `{tool_name, arguments}` | 一次调一个 |
+| `call_tools` | 写一段程序批量调用工具 | 要连着调好几个，而中间结果不必进对话 |
+
+`call_tools` 干活的是一段**模型写的 TypeScript 程序**（DSH 的 PTC 运行时负责跑它）。
+程序里只有两个函数可调：`tools.find_tools({query})` 与 `tools.call_tool({tool_name, arguments})`。
+**只有程序 `return` 的值会回到对话里** —— 读十个文件、跑十次搜索，中间那些内容不必挤进上下文。
+
+它的参数、输出与界面呈现都对齐 DSH 官方 PTC 模式的 `run_code`：`description` 必填
+（那是卡片标题，也是审批弹窗里给人看的第一行字）、控制参数只在运行时真的支持时才出现、
+输出是结构化的 `{logs, result?, sandbox?}`、失败是带 `kind` 的 `CodeRunFailedError`。
+
+**唯一刻意不一样的地方**：官方 `run_code` 的 SDK 段落是遍历注册表生成的（把一百多个工具
+的名字和参数全喂给模型），我们这里是手写的两条声明 —— 那正是这个插件要消掉的东西。
+
+### 什么时候不挂 `call_tools`
+
+- **PTC 模式已经开着**（`mode: 'ptc'` 或 `'both'`）：那时 DSH 自己的 `run_code` 就在工具表里，
+  再加一个功能重叠的只会让模型困惑该用哪个（而在 `mode: 'ptc'` 下它本来也调不到 ——
+  那个模式的执行守卫只放行 `run_code`）。
+- **部署里没挂 PTC 运行时**（`ctx.ptcRuntime` 缺席）：挂了也跑不了。
+
+检测用公开的 `tools.schemas(agent)` 看 `run_code` 在不在可见集里 —— 那正好是
+`modeFor(scope) !== 'native'` 的判据。检测**按会话算**（preset 可以用 `tools.presentAs()`
+单独选一个呈现模式），读不出来时保守地**不挂**：少一个能力不等于出错，
+而抢 PTC 的位置会真的出错。
 
 ## 装
 
@@ -39,7 +70,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 - 状态持久在 `$DSH_HOME/storages` 下的 `tool_gateway/sessions` 里，重启后仍然生效。
 - **子代理会话跟随父会话**：你只看得见父会话，而子代理的工具组合本来也是从父那里继承的。
 - 关掉之后：模型看到完整工具表、可以直接调用任何工具、系统提示里也不再出现那段使用说明。
-  两个元工具仍然在（它们只是不再是唯一入口）。
+  元工具仍然在（它们只是不再是唯一入口）。
 - **生效时机**：执行守卫**立刻**生效（下一次工具调用就放开或拦住）；
   工具表与提示段落**从下一轮请求开始**生效（装配发生在每一轮开始的时候）。
 - **切换时会往会话里注入一条通知给模型看。** 模型看不见"装配"这件事本身，没有这条通知，
@@ -58,7 +89,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 两层，缺一不可：
 
 1. **可见性** —— 在 `system-prompt/assemble` 瀑布里过滤 `assembled.tools`，
-   模型可见的工具表只剩两个元工具。这一步**不碰注册表**。
+   模型可见的工具表只剩那几个元工具（具体几个按会话算，见上）。这一步**不碰注册表**。
 2. **执行守卫** —— `ctx.tools.guard()` 拒绝模型对其它工具的直接调用。
    少了这一层，模型只要从历史里记得某个工具名、或者猜中一个，直接调用就会成功 ——
    注册表里那些工具一直都在。
@@ -74,10 +105,11 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 
 | 文件 | 职责 |
 |---|---|
-| `src/host.js` | 入口：接线，不实现任何一件具体的事 |
+| `src/host.js` | 入口：接线，不实现任何一件具体的事。`keepFor(agent)` 在这里（含 PTC 检测） |
 | `src/catalog.js` | 检索索引（jieba 切词 + 拼音 + minisearch 倒排） |
-| `src/meta-tools.js` | `find_tools` / `call_tool` 两个元工具 |
-| `src/gateway.js` | 可见性过滤、执行守卫、提示段落，都按 `enabledFor(agent)` 分支 |
+| `src/meta-tools.js` | `find_tools` / `call_tool`，以及三个元工具共用的 `invokeTool` |
+| `src/code-tools.js` | `call_tools`：把一段程序交给 PTC 运行时，只绑两个函数 |
+| `src/gateway.js` | 可见性过滤、执行守卫、提示段落，都按 `keepFor(agent)` / `enabledFor(agent)` 分支 |
 | `src/session-key.js` | 一个 agent 的开关记在哪个会话名下（子代理跟随父） |
 | `src/switch-state.js` | 开关状态的读写与持久化（默认开） |
 | `src/route.js` | 给浏览器 chip 用的 HTTP 接口（含"状态变了才通知"的判断） |
@@ -124,7 +156,15 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 - **过滤出错时降级**：白名单一个都没匹配上就放行完整目录并告警一次 ——
   工具多一点只是浪费，会话起不来是事故。
 - **不处理非文本块的内容**：`call_tool` 把图片等非文本块经 `deferContext` 作为独立
-  上下文送出，不做转码或裁剪。
+  上下文送出，不做转码或裁剪。`call_tools` 的子调用也一样（程序里调到的图片会附在那次结果之后）。
+- **`call_tools` 的程序里能调到的，就只有那两个函数。** 绑定只给
+  `tools.find_tools` 与 `tools.call_tool` —— 程序不能直接写 `tools.read({...})`。
+  这不是限制调用（子调用走的还是注册表的公开执行入口，审批、守卫、沙箱一样不少），
+  而是**不让工具目录再被喂回模型**：官方 PTC 的 SDK 段落会列出全部工具的签名，
+  我们这段只有两行。
+- **程序结束就中止还在飞的子调用。** 程序写了 `tools.call_tool(...)` 却没 `await`，
+  那个调用不会在结果返回之后继续跑下去 —— 它会随这次运行一起停掉，而且会等它
+  收完尾才把结果交出去（不等的话，它的会话日志会落在这次调用之后）。
 - 依赖三个包：`@node-rs/jieba`（原生模块）、`pinyin-pro`、`minisearch`。前两个都是
   预编译分发、无 install 脚本、零运行时依赖树。
 
@@ -132,7 +172,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 
 ```sh
 pnpm install
-pnpm test          # 91 个测试
+pnpm test          # 126 个测试
 pnpm build         # 校验后逐字节拷贝 src/ → lib/
 ```
 

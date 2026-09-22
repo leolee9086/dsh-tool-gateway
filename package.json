@@ -1,7 +1,7 @@
 {
   "name": "dsh-tool-gateway",
   "version": "0.1.1",
-  "description": "把 DSH 的工具目录收成两个元工具：find_tools 查、call_tool 调；其余工具不出现在模型可见目录里，但仍然可被调用",
+  "description": "把 DSH 的工具目录收成三个元工具：find_tools 查、call_tool 调、call_tools 批量调；其余工具不出现在模型可见目录里，但仍然可被调用",
   "author": "leolee9086",
   "repository": {
     "type": "git",

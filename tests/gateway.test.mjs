@@ -4,12 +4,12 @@
  * 这里的 ctx 是手写的桩 —— 网关层只碰 `ctx.on` / `ctx.effect` / `ctx.tools.guard` /
  * `ctx.systemPrompt.section` 四个入口，桩足够表达契约，不需要真跑一个 DSH。
  *
- * `enabledFor` 在这个文件里是直接给死值的函数：开关状态怎么算（归属会话、持久化）
+ * 名单在这个文件里是写死的函数：**名单里为什么是三个或两个元工具**（PTC 开不开）
  * 是 host.js 那一层的事，各有自己的测试文件。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { DENY_REASON, installAssembleFilter, installGuard, installNotice, noticeText } from '../src/gateway.js'
+import { denyReason, installAssembleFilter, installGuard, installNotice, noticeText } from '../src/gateway.js'
 
 /** 够用的插件上下文桩。 */
 function stubCtx() {
@@ -53,24 +53,51 @@ const assemblyOf = (...names) => ({
   tools: names.map((name) => ({ name })),
 })
 
-/** 一个假 agent：网关层只用它去问开关，别的什么都不看。 */
+/** 一个假 agent：网关层只用它去问开关与名单，别的什么都不看。 */
 const agent = { session: { id: 'session-x', header: {} } }
 
 const alwaysOn = () => true
 const alwaysOff = () => false
 
-test('可见性过滤：只留白名单里的工具', async () => {
+/** PTC 没开时的名单：两个元工具。 */
+const keepTwo = () => new Set(['find_tools', 'call_tool'])
+/** PTC 开着时的名单：多一个批量调用的（而它其实在 PTC 下也调不到）。 */
+const keepThree = () => new Set(['find_tools', 'call_tool', 'call_tools'])
+
+test('可见性过滤：只留名单里的工具', async () => {
   const ctx = stubCtx()
-  installAssembleFilter(ctx, new Set(['find_tools', 'call_tool']), alwaysOn, () => {})
+  installAssembleFilter(ctx, keepTwo, alwaysOn, () => {})
   const handler = ctx.handlerOf('system-prompt/assemble')
 
   const result = await handler({}, { agent }, async () => assemblyOf('find_tools', 'read', 'bash', 'call_tool'))
   assert.deepEqual(result.tools.map((tool) => tool.name), ['find_tools', 'call_tool'])
 })
 
+test('可见性过滤：名单里有第三个时它也在', async () => {
+  const ctx = stubCtx()
+  installAssembleFilter(ctx, keepThree, alwaysOn, () => {})
+  const handler = ctx.handlerOf('system-prompt/assemble')
+
+  const result = await handler({}, { agent }, async () => assemblyOf('find_tools', 'read', 'call_tool', 'call_tools'))
+  assert.deepEqual(result.tools.map((tool) => tool.name), ['find_tools', 'call_tool', 'call_tools'])
+})
+
+test('可见性过滤：名单是按 agent 现算的，不同会话可以不一样', async () => {
+  const ctx = stubCtx()
+  // 一个会话在 PTC 模式（两个），另一个不在（三个）。
+  installAssembleFilter(ctx, (target) => (target === agent ? keepTwo() : keepThree()), alwaysOn, () => {})
+  const handler = ctx.handlerOf('system-prompt/assemble')
+  const other = { session: { id: 'session-y', header: {} } }
+
+  const forAgent = await handler({}, { agent }, async () => assemblyOf('find_tools', 'call_tool', 'call_tools'))
+  const forOther = await handler({}, { agent: other }, async () => assemblyOf('find_tools', 'call_tool', 'call_tools'))
+  assert.deepEqual(forAgent.tools.map((tool) => tool.name), ['find_tools', 'call_tool'])
+  assert.deepEqual(forOther.tools.map((tool) => tool.name), ['find_tools', 'call_tool', 'call_tools'])
+})
+
 test('可见性过滤：保留装配产物的其它字段', async () => {
   const ctx = stubCtx()
-  installAssembleFilter(ctx, new Set(['find_tools']), alwaysOn, () => {})
+  installAssembleFilter(ctx, () => new Set(['find_tools']), alwaysOn, () => {})
   const handler = ctx.handlerOf('system-prompt/assemble')
 
   const result = await handler({}, { agent }, async () => ({
@@ -82,10 +109,10 @@ test('可见性过滤：保留装配产物的其它字段', async () => {
   assert.equal(result.variables.cwd, '/work')
 })
 
-test('可见性过滤：白名单一个都没匹配到时，放行完整目录并告警一次', async () => {
+test('可见性过滤：名单一个都没匹配到时，放行完整目录并告警一次', async () => {
   const ctx = stubCtx()
   const warnings = []
-  installAssembleFilter(ctx, new Set(['find_tools']), alwaysOn, (error) => warnings.push(error))
+  installAssembleFilter(ctx, () => new Set(['find_tools']), alwaysOn, (error) => warnings.push(error))
   const handler = ctx.handlerOf('system-prompt/assemble')
 
   const result = await handler({}, { agent }, async () => assemblyOf('read', 'bash'))
@@ -96,7 +123,7 @@ test('可见性过滤：白名单一个都没匹配到时，放行完整目录�
 
 test('可见性过滤：会话把网关关掉时，工具表原样返回', async () => {
   const ctx = stubCtx()
-  installAssembleFilter(ctx, new Set(['find_tools', 'call_tool']), alwaysOff, () => {})
+  installAssembleFilter(ctx, keepTwo, alwaysOff, () => {})
   const handler = ctx.handlerOf('system-prompt/assemble')
 
   const result = await handler({}, { agent }, async () => assemblyOf('find_tools', 'read', 'bash', 'call_tool'))
@@ -107,7 +134,7 @@ test('可见性过滤：装配里没有 agent（诊断装配）时按默认处�
   const ctx = stubCtx()
   // enabledFor 收到 undefined 时返回 true —— 这正是 host.js 里的默认策略。
   const seen = []
-  installAssembleFilter(ctx, new Set(['find_tools']), (target) => {
+  installAssembleFilter(ctx, () => new Set(['find_tools']), (target) => {
     seen.push(target)
     return true
   }, () => {})
@@ -118,18 +145,30 @@ test('可见性过滤：装配里没有 agent（诊断装配）时按默认处�
   assert.deepEqual(result.tools.map((tool) => tool.name), ['find_tools'])
 })
 
-test('执行守卫：放行两个元工具', () => {
+test('可见性过滤：名单算不出来时降级放行，不让会话起不来', async () => {
   const ctx = stubCtx()
-  installGuard(ctx, new Set(['find_tools', 'call_tool']), alwaysOn)
+  const warnings = []
+  installAssembleFilter(ctx, () => { throw new Error('注册表炸了') }, alwaysOn, (error) => warnings.push(error))
+  const handler = ctx.handlerOf('system-prompt/assemble')
+
+  const result = await handler({}, { agent }, async () => assemblyOf('find_tools', 'read'))
+  assert.equal(result.tools.length, 2)
+  assert.equal(warnings.length, 1)
+})
+
+test('执行守卫：放行名单里的元工具', () => {
+  const ctx = stubCtx()
+  installGuard(ctx, keepThree, alwaysOn)
   const guard = ctx.guards[0]
 
   assert.equal(guard({ name: 'find_tools', agent }), undefined)
   assert.equal(guard({ name: 'call_tool', agent }), undefined)
+  assert.equal(guard({ name: 'call_tools', agent }), undefined)
 })
 
 test('执行守卫：放行带 parent 的子分发（call_tool 内部发起的调用）', () => {
   const ctx = stubCtx()
-  installGuard(ctx, new Set(['find_tools', 'call_tool']), alwaysOn)
+  installGuard(ctx, keepTwo, alwaysOn)
   const guard = ctx.guards[0]
 
   assert.equal(guard({ name: 'read', parent: { token: 'x' }, agent }), undefined)
@@ -137,19 +176,32 @@ test('执行守卫：放行带 parent 的子分发（call_tool 内部发起的�
 
 test('执行守卫：拒绝模型对其它工具的直接调用，理由写给模型看', () => {
   const ctx = stubCtx()
-  installGuard(ctx, new Set(['find_tools', 'call_tool']), alwaysOn)
+  installGuard(ctx, keepTwo, alwaysOn)
   const guard = ctx.guards[0]
 
-  assert.equal(guard({ name: 'read', agent }), DENY_REASON)
-  assert.equal(guard({ name: 'zhihu_search', agent }), DENY_REASON)
+  assert.equal(guard({ name: 'read', agent }), denyReason(keepTwo()))
+  assert.equal(guard({ name: 'zhihu_search', agent }), denyReason(keepTwo()))
   // 拒绝理由要能指导下一步，不是错误码。
-  assert.match(DENY_REASON, /find_tools/)
-  assert.match(DENY_REASON, /call_tool/)
+  const reason = denyReason(keepTwo())
+  assert.match(reason, /find_tools/)
+  assert.match(reason, /call_tool/)
+})
+
+test('执行守卫：拒绝理由按这个会话实际可用的元工具生成', () => {
+  const ctx = stubCtx()
+  installGuard(ctx, keepThree, alwaysOn)
+  const guard = ctx.guards[0]
+
+  const reason = guard({ name: 'read', agent })
+  assert.match(reason, /call_tools/)
+  assert.equal(reason, denyReason(keepThree()))
+  // PTC 开着时不能提 call_tools —— 那会把模型引向一个不存在的工具。
+  assert.doesNotMatch(denyReason(keepTwo()), /call_tools/)
 })
 
 test('执行守卫：会话把网关关掉时不拦，模型可以直接调', () => {
   const ctx = stubCtx()
-  installGuard(ctx, new Set(['find_tools', 'call_tool']), alwaysOff)
+  installGuard(ctx, keepTwo, alwaysOff)
   const guard = ctx.guards[0]
 
   assert.equal(guard({ name: 'read', agent }), undefined)
@@ -157,8 +209,8 @@ test('执行守卫：会话把网关关掉时不拦，模型可以直接调', ()
 
 test('执行守卫：子分发的放行在开关之前判定 —— 关掉的会话里子分发照样走', () => {
   const ctx = stubCtx()
-  // 开关故意写成"读到就抛"，用来证明带 parent 的调用根本没走到它。
-  installGuard(ctx, new Set(['find_tools']), () => { throw new Error('不该被问到') })
+  // 开关与名单故意写成“读到就抛”，用来证明带 parent 的调用根本没走到它们。
+  installGuard(ctx, () => { throw new Error('不该被问到') }, () => { throw new Error('不该被问到') })
   const guard = ctx.guards[0]
 
   assert.equal(guard({ name: 'read', parent: { token: 'x' }, agent }), undefined)
@@ -166,7 +218,7 @@ test('执行守卫：子分发的放行在开关之前判定 —— 关掉的会
 
 test('提示段落：开着的会话拿到完整文案', () => {
   const ctx = stubCtx()
-  installNotice(ctx, alwaysOn)
+  installNotice(ctx, keepTwo, alwaysOn)
 
   assert.equal(ctx.sections.length, 1)
   const section = ctx.sections[0]
@@ -177,21 +229,34 @@ test('提示段落：开着的会话拿到完整文案', () => {
   const text = section.text({ agent })
   assert.match(text, /find_tools/)
   assert.match(text, /call_tool/)
+  assert.match(text, /只暴露 2 个工具/)
   // 排在各工具说明（order 1000+）之前，让模型先读到规则。
   assert.ok(section.order < 1000)
 })
 
+test('提示段落：PTC 开着时不提 call_tools，提了反而是误导', () => {
+  const ctx = stubCtx()
+  installNotice(ctx, keepTwo, alwaysOn)
+  assert.doesNotMatch(ctx.sections[0].text({ agent }), /call_tools/)
+
+  const withCode = stubCtx()
+  installNotice(withCode, keepThree, alwaysOn)
+  const text = withCode.sections[0].text({ agent })
+  assert.match(text, /call_tools/)
+  assert.match(text, /只暴露 3 个工具/)
+})
+
 test('提示段落：关掉的会话拿到空串，不在系统提示里留一个空标题', () => {
   const ctx = stubCtx()
-  installNotice(ctx, alwaysOff)
+  installNotice(ctx, keepTwo, alwaysOff)
 
   assert.equal(ctx.sections[0].text({ agent }), '')
 })
 
-test('提示段落：文案里说清了"历史里出现过的工具名不要直接输出"', () => {
-  assert.match(noticeText(), /不要直接输出历史里出现过的工具名/)
+test('提示段落：文案里说清了“历史里出现过的工具名不要直接输出”', () => {
+  assert.match(noticeText(keepTwo()), /不要直接输出历史里出现过的工具名/)
 })
 
-test('提示段落：文案要求"每一次动手之前都先查"（这是网关的目的，不是省 token）', () => {
-  assert.match(noticeText(), /每一次动手之前都先查清楚/)
+test('提示段落：文案要求“每一次动手之前都先查”（这是网关的目的，不是省 token）', () => {
+  assert.match(noticeText(keepTwo()), /每一次动手之前都先查清楚/)
 })
