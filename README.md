@@ -14,17 +14,16 @@
 ## 装
 
 ```sh
-# 在 DSH Web profile 目录（默认 ~/.dsh/profiles/web）
-pnpm add 'github:leolee9086/dsh-tool-gateway#v0.1.0'
+dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.0
 ```
 
-装完在 profile 里启用（`~/.dsh/profiles/web/cordis.patch.yml`）：
+`dsh plugin --profile <name> <args...>` 在 profile 目录里转发给 pnpm。装完它会依据本包
+`package.json` 的 `dsh.bundle.patch` 声明，把本包追加进 `dsh.profile.bundles` ——
+于是每次启动自动插入加载行，**不需要手工编辑 profile 的 `cordis.patch.yml`**。
 
-```yaml
-- insert:
-    - id: tool-gateway
-      name: "dsh-tool-gateway"
-```
+本包的 `lib/` 随仓库提交，所以从 git 安装**不需要 pnpm 的构建授权**（`allowBuilds`）：
+拉下来就是能直接加载的产物，包里没有 `prepare` 脚本，安装时不会在你机器上跑构建。
+想锁得更死，把 `#v0.1.0` 换成具体的 commit sha。
 
 重启 DSH 生效。**不需要改任何 preset** —— 它挂在 profile 层（根作用域）一次，
 对所有 preset、所有会话生效。
