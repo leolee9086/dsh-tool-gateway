@@ -1,0 +1,6 @@
+# 依赖：安装方自己 pnpm install
+node_modules/
+
+# 日志与系统垃圾
+*.log
+.DS_Store

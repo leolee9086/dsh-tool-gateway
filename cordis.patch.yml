@@ -1,0 +1,16 @@
+# dsh-tool-gateway 自带的 bundle 补丁层。
+# `dsh plugin --profile web add <checkout>` 会依据 package.json 的
+# `dsh.bundle.patch` 把本包并入 dsh.profile.bundles，此层即在每次启动时插入
+# 自身的加载行；无需手工编辑 profile 的 cordis.patch.yml。
+#
+# 挂在 profile 层（根作用域）一次，对所有 preset、所有会话生效 —— 这是刻意的：
+# 它要接管的是"模型看到哪些工具"，而那件事本来就发生在每一轮请求的组装上，
+# 与 preset 无关。挂进 preset 反而会退化成"每个 preset 各挂一遍、老会话还得打补丁"。
+#
+# "会话级开关"说的是**约束可以按会话关掉**，不是"按会话各挂一份插件"：
+# 仍然是这一行、这一份实现，只是它读每个会话自己的开关（默认开，覆盖值持久在
+# storage domain 的 tool_gateway/sessions 里）。开关的界面是会话标题栏上的 chip，
+# 由 package.json 的 exports["./client"] + dsh.client 声明带出来。
+- insert:
+    - id: tool-gateway
+      name: "dsh-tool-gateway"
