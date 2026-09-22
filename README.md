@@ -14,7 +14,7 @@
 ## 装
 
 ```sh
-dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.0
+dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 ```
 
 `dsh plugin --profile <name> <args...>` 在 profile 目录里转发给 pnpm。装完它会依据本包
