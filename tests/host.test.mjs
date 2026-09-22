@@ -70,6 +70,11 @@ function stubCtx({
   const routes = []
   const disposers = []
   const warnings = []
+  // 晚到的服务，以及等着它们的 inject 回调。真实 Cordis 里 webServer / connection
+  // 就是这样出现在插件之后的 —— 桩必须能演这一幕，"急切 ctx.get 会漏掉路由"这个
+  // 缺陷只有在能演这一幕的桩上才会现形。
+  const overrides = new Map()
+  const pending = []
 
   const ctx = {
     registeredTools,
@@ -80,6 +85,7 @@ function stubCtx({
     warnings,
     logger: { warn: (message) => warnings.push(message), error: () => {} },
     get(service) {
+      if (overrides.has(service)) return overrides.get(service)
       if (service === 'storageDomain') return storage
       if (service === 'agents') return { get: (id) => (agents.has(id) ? { session: agents.get(id) } : undefined) }
       if (service === 'ptcRuntime') return ptcRuntime
@@ -94,6 +100,27 @@ function stubCtx({
       }
       if (service === 'connection') return withWeb ? { requestRejection: () => undefined } : undefined
       return undefined
+    },
+    /**
+     * 等一组服务就绪再执行。桩照真实语义来：服务齐了就立刻执行；缺着就先记下，
+     * 等 provide 补上再执行 —— 缺着的那一次**不执行**，这正是急切 ctx.get 漏掉的东西。
+     * @param {string[]} deps 服务名
+     * @param {Function} callback 就绪后的回调（真实 Cordis 会传一个 fork 出来的 ctx）
+     * @returns {Function} 取消等待
+     */
+    inject(deps, callback) {
+      const entry = { deps: [...deps], callback }
+      pending.push(entry)
+      flush()
+      return () => {
+        const at = pending.indexOf(entry)
+        if (at !== -1) pending.splice(at, 1)
+      }
+    },
+    /** 让一个服务晚到。 */
+    provide(service, value) {
+      overrides.set(service, value)
+      flush()
     },
     on(event, handler) {
       if (!listeners.has(event)) listeners.set(event, [])
@@ -126,6 +153,16 @@ function stubCtx({
       return listeners.get(event)?.[0]
     },
   }
+
+  /** 把所有依赖已经齐了的等待跑掉。 */
+  function flush() {
+    for (const entry of [...pending]) {
+      if (!entry.deps.every((dep) => ctx.get(dep) !== undefined)) continue
+      pending.splice(pending.indexOf(entry), 1)
+      entry.callback(ctx)
+    }
+  }
+
   return ctx
 }
 
@@ -210,15 +247,50 @@ test('端到端：子代理会话跟随父会话的开关', async () => {
   assert.equal(ctx.guards[0]({ name: 'read', agent: { session: child } }), undefined)
 })
 
-test('没有 webServer / connection 时不注册路由，但网关照常工作并告警一次', async () => {
+test('没有 webServer / connection 时不注册路由，网关照常工作，也不告警', async () => {
   const ctx = stubCtx({ storage: stubStorageDomain(), withWeb: false })
   await apply(ctx)
 
   assert.equal(ctx.routes.length, 0)
   assert.equal(ctx.registeredTools.length, 3)
   assert.equal(ctx.guards.length, 1)
+  // 服务永远不来是 headless profile 的正常样子，不是错误 —— 喊它只会变成噪声。
+  assert.deepEqual(ctx.warnings, [])
+})
+
+test('webServer 晚到也照样把路由挂上（急切 ctx.get 会在这里漏掉它）', async () => {
+  const ctx = stubCtx({ storage: stubStorageDomain(), withWeb: false })
+  await apply(ctx)
+  assert.equal(ctx.routes.length, 0)
+
+  // 服务比插件晚到 —— 真实 Cordis 里就是这个顺序：tool-gateway 是 patch 的最后一个
+  // insert，而 webServer / connection 在更早的 bundle 层里异步就绪。
+  ctx.provide('webServer', {
+    register(route) {
+      ctx.routes.push(route)
+      return () => { ctx.routes.pop() }
+    },
+  })
+  assert.equal(ctx.routes.length, 0, '只到了一半，还不该挂')
+
+  ctx.provide('connection', { requestRejection: () => undefined })
+  assert.equal(ctx.routes.length, 1)
+  assert.equal(ctx.routes[0].path, '/api/tool-gateway')
+  assert.equal(ctx.routes[0].kind, 'exact')
+  assert.equal(typeof ctx.routes[0].handler, 'function')
+})
+
+test('服务在、但形状不对时告警一次，网关照常工作', async () => {
+  const ctx = stubCtx({ storage: stubStorageDomain(), withWeb: false })
+  await apply(ctx)
+
+  // 拿到了 webServer，但它不是路由载体 —— 这是真异常，要说出来。
+  ctx.provide('webServer', {})
+  ctx.provide('connection', { requestRejection: () => undefined })
+
+  assert.equal(ctx.routes.length, 0)
   assert.equal(ctx.warnings.length, 1)
-  assert.match(ctx.warnings[0], /webServer/)
+  assert.match(ctx.warnings[0], /形状不对/)
 })
 
 test('storage 用不了时仍然挂得起来，只是开关不持久', async () => {

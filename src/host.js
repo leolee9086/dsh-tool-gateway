@@ -206,16 +206,29 @@ export async function apply(ctx, config = {}) {
   installGuard(ctx, keepFor, enabledFor)
   installNotice(ctx, keepFor, enabledFor)
 
-  // 会话开关的 HTTP 接口。webServer 或 connection 不在时整块跳过：
-  // 那样就没有浏览器侧的开关，但网关本身照常工作。
-  const webServer = ctx.get('webServer')
-  if (webServer !== undefined && ctx.get('connection') !== undefined) {
+  // 会话开关的 HTTP 接口。
+  //
+  // **必须用 ctx.inject 延迟取得，不能急切 ctx.get。** webServer 与 connection 都可能比
+  // 本插件更晚加载，急切读会拿到 undefined，于是整块被静默跳过 —— 现象是"插件装上了、
+  // 网关也照常工作，只有标题栏那个 chip 永远失败"，日志里一个字都不留。
+  // （dsh-marduk 与 dsh-better-session-query 都在同一个坑里待过。）
+  //
+  // 写进 `inject` 也不对：headless profile 没有这两个服务，插件会一直停在 PENDING，
+  // 那是拿核心功能给附件陪葬。ctx.inject 两边都不占 —— 服务到了再挂，没到就只是没有界面，
+  // 而"没有界面"在 headless 下是设计内的形态，不是错误，所以这里不告警。
+  //
+  // 回调**绝不能有返回值**：Cordis 把插件回调的返回值当 Effect 处理，返回一个非函数
+  // 非对象的值会抛 TypeError("Invalid effect")，让这个 fiber 加载失败、并把已经挂上的
+  // 东西一起回滚掉，同样一个字都不留。
+  ctx.inject(['webServer', 'connection'], (webCtx) => {
+    const webServer = webCtx.get('webServer')
+    const connection = webCtx.get('connection')
+    if (webServer === undefined || typeof webServer.register !== 'function'
+      || connection === undefined || typeof connection.requestRejection !== 'function') {
+      warnOnce(new Error('webServer 或 connection 形状不对，会话开关没有界面（网关本身照常工作）'))
+      return
+    }
     const handler = createGatewayRoute(ctx, state)
-    ctx.effect(() => {
-      const unregister = webServer.register({ kind: 'exact', path: ROUTE, handler })
-      return () => { unregister() }
-    }, `${name}: 会话开关路由`)
-  } else {
-    warnOnce(new Error('webServer 或 connection 不可用，会话开关没有界面（网关本身照常工作）'))
-  }
+    ctx.effect(() => webServer.register({ kind: 'exact', path: ROUTE, handler }), `${name}: 会话开关路由`)
+  })
 }
