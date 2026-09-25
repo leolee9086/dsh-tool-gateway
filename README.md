@@ -62,7 +62,7 @@
 ## 装
 
 ```sh
-dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.0
+dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
 ```
 
 `dsh plugin --profile <name> <args...>` 在 profile 目录里转发给 pnpm。装完它会依据本包
@@ -71,7 +71,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.0
 
 本包的 `lib/` 随仓库提交，所以从 git 安装**不需要 pnpm 的构建授权**（`allowBuilds`）：
 拉下来就是能直接加载的产物，包里没有 `prepare` 脚本，安装时不会在你机器上跑构建。
-想锁得更死，把 `#v0.2.0` 换成具体的 commit sha。
+想锁得更死，把 `#v0.2.1` 换成具体的 commit sha。
 
 重启 DSH 生效。**不需要改任何 preset** —— 它挂在 profile 层（根作用域）一次，
 对所有 preset、所有会话生效。
