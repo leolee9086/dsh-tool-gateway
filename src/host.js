@@ -18,6 +18,7 @@
  *
  * 这里只做接线，不实现任何一件具体的事。
  */
+import { createBanGuard, installBanVisibility, resolveBanOptions } from './ban.js'
 import { createCatalog } from './catalog.js'
 import { CALL_TOOLS, createCodeTools } from './code-tools.js'
 import { CALL_TOOL, FIND_TOOLS, createMetaTools } from './meta-tools.js'
@@ -40,6 +41,12 @@ export const inject = ['tools', 'systemPrompt']
 
 /** find_tools 一次返回几条。 */
 const DEFAULT_MAX_RESULTS = 5
+
+/** 三个元工具名。它们在面板里不可关 —— 关了就等于把这个会话的工具入口全部封死。 */
+const META_TOOL_NAMES = new Set([FIND_TOOLS, CALL_TOOL, CALL_TOOLS])
+
+/** 共享的空集合：没有 agent 的判定路径直接用它，省一次分配。 */
+const NO_NAMES = new Set()
 
 /**
  * DSH 自己的 PTC 呈现通道的名字。它被注册表无条件保留（`tools.register()` 对它直接抛错），
@@ -84,6 +91,50 @@ export async function apply(ctx, config = {}) {
   // 归属会话换算：子代理会话跟随父会话（理由见 session-key.js）。
   const lookup = parentLookup(ctx)
 
+  // ── 硬禁用名单（原 dsh-tool-ban 的能力） ──────────────────────────────────
+  //
+  // 配置放在 config.ban 里，与网关自己的 maxResults 分开：前者是「任何会话都不许」，
+  // 后者是「网关怎么工作」。混在同一层里，读配置的人迟早会把两者看成一回事。
+  const banOptions = resolveBanOptions(config?.ban)
+
+  /** 静态名单的判定。纯函数，命中就给出拒绝理由，不命中返回 undefined。 */
+  const staticBan = createBanGuard(banOptions.deny, banOptions.reason)
+
+  /**
+   * 这个会话里被用户逐个关掉的工具名。
+   *
+   * **按会话记**：关掉一个工具是「这次别用它」的决定，下一个会话里该不该用它，是另一个
+   * 决定 —— 面板就开在当前会话的右侧栏里，它管的就是眼前这一份工具表。
+   *
+   * 没有 agent 时不查（诊断装配与插件自己发起的调用都属于这一类）：它们不是某个会话里
+   * 模型的手，会话级的偏好管不到它们。
+   *
+   * @param {object|undefined} agent 目标 agent
+   * @returns {Set<string>} 关掉的工具名
+   */
+  const disabledFor = (agent) => {
+    if (agent === undefined || agent === null) return NO_NAMES
+    return state.disabledTools(ownerSessionId(agent.session, lookup))
+  }
+
+  /**
+   * 这条调用是不是被硬禁用。**这是守卫里的第一段判断**（见 gateway.js）。
+   *
+   * 两段合起来才是完整语义：静态名单管「部署不让用」，会话记录管「我这次不想让它用」。
+   * 两段都不看 parent —— 所以 call_tool 也绕不过去。
+   *
+   * @param {object} execution 工具执行身份
+   * @returns {string|undefined} 拒绝理由，放行时 undefined
+   */
+  const banFor = (execution) => {
+    const name = execution?.name
+    if (typeof name !== 'string') return undefined
+    const staticReason = staticBan(execution)
+    if (staticReason !== undefined) return staticReason
+    if (!disabledFor(execution?.agent).has(name)) return undefined
+    return '工具「' + name + '」已被关掉（本会话）。要重新用它，先在右侧栏的工具箱面板里打开它。'
+  }
+
   /**
    * 这个 agent 的会话要不要施加约束。
    *
@@ -110,9 +161,15 @@ export async function apply(ctx, config = {}) {
   // 缓存用代际号失效：tools/change（注册、注销、作用域限制变化）一响，
   // 已缓存的视图就地作废，下次用到时重建。
   let generation = 0
+  // 面板改了「这个会话关掉哪些工具」也要让视图失效 —— 否则 find_tools 还会把刚关掉的
+  // 工具列出来，模型照着调一次又被守卫拒绝。两件事都改变视图，所以各有一个计数。
+  let prefs = 0
   const views = new WeakMap()
 
   ctx.on('tools/change', () => { generation++ })
+
+  /** 会话级偏好变了：作废所有已缓存的视图，下次用到时重建。 */
+  const invalidate = () => { prefs++ }
 
   /**
    * 取某个 agent 这一轮的工具视图。
@@ -134,11 +191,21 @@ export async function apply(ctx, config = {}) {
       return { catalog, names: new Set(schemas.map((schema) => schema.name)) }
     }
     const cached = views.get(agent)
-    if (cached !== undefined && cached.generation === generation) return cached
+    if (cached !== undefined && cached.generation === generation && cached.prefs === prefs) return cached
     const schemas = ctx.tools.schemas(agent)
+    // 索引里只放**没被关掉**的工具：关掉的工具模型调不动（守卫拒绝），
+    // 让它出现在 find_tools 的结果里只会把模型引向一次必然失败的调用。
+    // `names` 不过滤 —— 它是 PTC 判据的输入，回答的是「注册表里有什么」，
+    // 不是「模型能用什么」。
+    const disabled = disabledFor(agent)
     const catalog = createCatalog()
-    catalog.rebuild(schemas)
-    const view = { generation, catalog, names: new Set(schemas.map((schema) => schema.name)) }
+    catalog.rebuild(schemas.filter((schema) => !disabled.has(schema.name)))
+    const view = {
+      generation,
+      prefs,
+      catalog,
+      names: new Set(schemas.map((schema) => schema.name)),
+    }
     views.set(agent, view)
     return view
   }
@@ -191,6 +258,36 @@ export async function apply(ctx, config = {}) {
     return names
   }
 
+  /**
+   * 面板要的工具清单。
+   *
+   * **这是给人看的数据，不是模型可见工具表。** 它包含被网关收起来的全部工具 ——
+   * 那正是面板存在的理由：网关让模型看不见它们，面板让人看得见、管得着。
+   *
+   * 契约：这个函数不抛。面板读不到清单只是面板空着，不该让插件加载失败。
+   *
+   * @param {object|undefined} agent 目标 agent
+   * @returns {Array<{name: string, description: string, disabled: boolean, banned: boolean, core: boolean}>}
+   *   工具清单，按名字排序
+   */
+  const listTools = (agent) => {
+    let schemas = []
+    try {
+      schemas = ctx.tools.schemas(agent)
+    } catch (error) {
+      warnOnce(error)
+      return []
+    }
+    const disabled = disabledFor(agent)
+    return schemas.map((schema) => ({
+      name: schema.name,
+      description: typeof schema.description === 'string' ? schema.description : '',
+      disabled: disabled.has(schema.name),
+      banned: banOptions.deny.includes(schema.name),
+      core: META_TOOL_NAMES.has(schema.name),
+    })).sort((a, b) => a.name.localeCompare(b.name))
+  }
+
   for (const definition of createMetaTools({
     ctx, resolveCatalog, maxResults, siblings: [CALL_TOOLS],
   })) {
@@ -203,8 +300,11 @@ export async function apply(ctx, config = {}) {
   }
 
   installAssembleFilter(ctx, keepFor, enabledFor, warnOnce)
-  installGuard(ctx, keepFor, enabledFor)
+  installGuard(ctx, keepFor, enabledFor, banFor)
   installNotice(ctx, keepFor, enabledFor)
+  // 可见性那一半（原 dsh-tool-ban 的 restrict 逻辑）。网关开着的会话里它是多余的 ——
+  // 目录本来就只剩元工具；网关被关掉的会话才用得上它，那种会话暴露的是完整工具表。
+  installBanVisibility(ctx, banOptions)
 
   // 会话开关的 HTTP 接口。
   //
@@ -228,7 +328,7 @@ export async function apply(ctx, config = {}) {
       warnOnce(new Error('webServer 或 connection 形状不对，会话开关没有界面（网关本身照常工作）'))
       return
     }
-    const handler = createGatewayRoute(ctx, state)
-    ctx.effect(() => webServer.register({ kind: 'exact', path: ROUTE, handler }), `${name}: 会话开关路由`)
+    const handler = createGatewayRoute(ctx, state, { listTools, invalidate, coreNames: META_TOOL_NAMES })
+    ctx.effect(() => webServer.register({ kind: 'exact', path: ROUTE, handler }), `${name}: 会话开关与工具箱面板路由`)
   })
 }

@@ -3,6 +3,9 @@
 把 DSH 的工具目录收成**三个元工具**：**`find_tools` 查、`call_tool` 调、`call_tools` 批量调**。
 其余工具不出现在模型可见的工具表里，但**仍然可以被调用** —— 只是入口变成了这几个。
 
+另外两件配套的事：**硬禁用名单**（某些工具在任何调用路径上都不许执行），以及**右侧栏的
+工具箱面板**（随时关掉某个工具 —— 关掉之后守卫拒绝、检索目录里也查不到它）。
+
 ## 它解决什么
 
 工具一多，真正的挑战不是上下文长度，而是**模型会不会只盯着被截断的那份工具列表将就**。
@@ -10,6 +13,20 @@
 
 这个插件把工具目录收起来，逼出"**每一次动手之前先查清楚有什么**"这个动作：
 那份长列表不在眼前了，模型只能先 `find_tools` 问、再 `call_tool` 调。
+
+## 顺带解决的一件更贵的事：前缀缓存
+
+工具定义在每次请求的**最前部**，所以工具表一变，整段前缀缓存就废了 —— 重新计费、首字延迟变长。
+而工具表恰恰是最容易变的那一块：接一个 MCP server、插件热插拔、换一个 preset 组合，都会改它。
+工具越多，这件事越贵。
+
+网关把模型可见的工具表**恒定**成那三个元工具：
+
+- 装插件、接 MCP、用面板关掉某个工具 —— **模型可见的工具表一个字节都不变**。
+  变的只是 `find_tools` 能检索到什么、以及守卫放不放行。
+- 想真正改工具表，只有动这三个元工具本身（`call_tools` 在 PTC 开着时会自动不挂）。
+
+这也是面板**只用「拒绝」、不用 `restrict()`** 的原因：后者会改模型可见工具表，那才会毁缓存。
 
 ## 三个元工具
 
@@ -45,7 +62,7 @@
 ## 装
 
 ```sh
-dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
+dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.0
 ```
 
 `dsh plugin --profile <name> <args...>` 在 profile 目录里转发给 pnpm。装完它会依据本包
@@ -54,7 +71,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 
 本包的 `lib/` 随仓库提交，所以从 git 安装**不需要 pnpm 的构建授权**（`allowBuilds`）：
 拉下来就是能直接加载的产物，包里没有 `prepare` 脚本，安装时不会在你机器上跑构建。
-想锁得更死，把 `#v0.1.0` 换成具体的 commit sha。
+想锁得更死，把 `#v0.2.0` 换成具体的 commit sha。
 
 重启 DSH 生效。**不需要改任何 preset** —— 它挂在 profile 层（根作用域）一次，
 对所有 preset、所有会话生效。
@@ -84,6 +101,45 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 没有 `webServer` / `connection` 服务的部署（比如 headless）不会挂这个界面，
 网关本身照常工作，开关固定为默认的"开"。
 
+## 工具箱面板
+
+右侧栏底部的「工具」按钮打开一个面板，里面是**这个会话**能看到的全部工具 —— 包括被网关
+收起来的那些。每个工具一行、一个开关。
+
+- 关掉一个工具 → 它从 `find_tools` 的结果里消失；模型就算照着历史去调也会被守卫拒绝，
+  拒绝理由里写清了「被关掉了、去哪儿打开」。同时会给这个会话注入一条通知，告诉模型刚刚
+  变了什么（同一条通知机制，见上一节）。
+- **按会话记**：关掉一个工具是「这次别用它」的决定，换一个会话该不该用它是另一个决定。
+  状态就在工具箱模式那份记录的 `disabledTools` 字段里，同一张表、同一条 `ownerSessionId`
+  归属规则（子代理会话里关掉的工具记在父会话名下，通知发给正在看的那个会话）。
+- **三个元工具不给关**（关了就没有工具入口了）；`config.ban.deny` 里的名字也不给点，
+  那是配置说了算。
+- 会话 id 由页签 seat 直接交给正文，面板不需要问用户在哪个会话。
+
+**为什么加它不会拖慢前缀缓存**：网关开着的时候，模型可见的工具表里只有那三个元工具。
+开关一个被收起来的工具，改的是**目录索引**（`find_tools` 检索到什么）与**守卫的判定**，
+两处都不在请求最前部那段工具定义里，所以整段前缀缓存不受影响。这也是面板**只用「拒绝」、
+不用 `restrict()`** 的原因 —— 后者会改模型可见工具表。
+
+## 硬禁用名单
+
+一部分工具在**任何**会话、**任何**调用路径上都不许执行。它和「网关没让它露面」是两件事：
+
+| | 拦住模型直接调用 | 拦住 `call_tool` 的子分发 |
+|---|---|---|
+| 被网关收起来 | 拦住 | 不拦（那正是元工具的用途） |
+| 被硬禁用 | 拦住 | **拦住** |
+
+默认禁用的是 `ask_user_question`（选择题卡片那一类交互）。它由同一条守卫的**第一段**判断
+实现 —— 排在 `parent` 那条判断之前，所以连 `call_tool` 也绕不过去。
+
+这一块原本是独立插件 `dsh-tool-ban`，现在并进网关：两者用的是同一个 `ctx.tools.guard`，
+分成两个包只会让「拒绝理由谁先谁后」变成两个包之间的隐式约定。它的可见性屏蔽（`restrict`）
+那一半也一并搬来了 —— 网关被关掉的会话暴露完整工具表，那一半在那里才有用。
+
+配置里写 `ban: { deny: [] }` 表示这次一个都不禁（显式写空数组才算数；完全不写 `deny`
+才用默认名单）。
+
 ## 它怎么工作
 
 两层，缺一不可：
@@ -109,12 +165,14 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 | `src/catalog.js` | 检索索引（jieba 切词 + 拼音 + minisearch 倒排） |
 | `src/meta-tools.js` | `find_tools` / `call_tool`，以及三个元工具共用的 `invokeTool` |
 | `src/code-tools.js` | `call_tools`：把一段程序交给 PTC 运行时，只绑两个函数 |
-| `src/gateway.js` | 可见性过滤、执行守卫、提示段落，都按 `keepFor(agent)` / `enabledFor(agent)` 分支 |
+| `src/gateway.js` | 可见性过滤、执行守卫（**硬禁用先判**）、提示段落，都按 `keepFor(agent)` / `enabledFor(agent)` 分支 |
+| `src/ban.js` | 硬禁用名单：静态名单的判定 + 按 agent 抹掉模型可见工具表（原 dsh-tool-ban） |
 | `src/session-key.js` | 一个 agent 的开关记在哪个会话名下（子代理跟随父） |
-| `src/switch-state.js` | 开关状态的读写与持久化（默认开） |
-| `src/route.js` | 给浏览器 chip 用的 HTTP 接口（含"状态变了才通知"的判断） |
-| `src/switch-notice.js` | 开关变化时写给模型的那条通知 |
-| `src/client.js` | 浏览器半边：会话标题栏的 chip |
+| `src/switch-state.js` | 开关状态与工具名单的读写与持久化（默认：约束开、一个都不禁） |
+| `src/route.js` | 给浏览器用的 HTTP 接口：会话开关（chip）+ 这个会话的工具清单与工具开关（面板） |
+| `src/producer-source.js` | 本插件在 V4 会话里的消息源归属（写错会让整轮毫秒级静默失败） |
+| `src/switch-notice.js` | 开关变化时写给模型的那条通知（两种粒度：整个工具箱模式、单个工具） |
+| `src/client.js` | 浏览器半边：会话标题栏的 chip + 右侧栏的工具箱面板 |
 
 ## 检索
 
@@ -141,6 +199,11 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
       name: "dsh-tool-gateway"
       config:
         maxResults: 5      # find_tools 一次返回几条，默认 5
+        ban:
+          deny: [ask_user_question]  # 硬禁用名单；显式写 [] 表示一个都不禁
+          hide: true                 # 还要把被禁的工具从模型可见表里摘掉
+          # reason: "…"              # 拒绝理由（会被模型读到），不写用内置那条
+          # maxHideAttempts: 5       # 可见性摘除的重试上限
 ```
 
 ## 边界
@@ -148,9 +211,16 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 - **不动会话历史。** 不改写、不压缩、不按历史分档、不扫会话事件判断状态。
   已经跑过一段的会话里那些直接调用 `read`、`bash` 的记录原样留着，
   说明里讲清楚了"入口变了"，模型会遵守。
-- **开关也不写会话日志。** 它不是"懒"而是"不能"：`Session.append` 没有写
+- **注入的消息用生产者自己的来源 kind。** 往会话里追加消息时 `source.kind` 必须是
+  `plugin:dsh-tool-gateway` —— V4 起消息源归生产者所有，退役的 `{ kind: 'plugin', plugin }`
+  会被会话准入直接拒绝。症状很隐蔽：那一轮在**毫秒级**失败、错误码是 `UNKNOWN`、
+  **会话日志一个字节都不写**，重试每次死在同一处。两个发出点（开关通知、工具结果的
+  非文本补充）共用 `src/producer-source.js`，kind 只在那一处拼。
+- **开关状态不写会话日志。** 它不是"懒"而是"不能"：`Session.append` 没有写
   `ignorable` 标记的通道，而读者遇到不认识的、没有该标记的事件**必须拒绝重建整个会话**。
   所以开关状态走 storage domain（`$DSH_HOME/storages`），与会话日志无关。
+  **通知是另一回事**：它作为一条合成 `user/message` 进日志（模型可见的东西因此仍然可重建），
+  所以它的 `source.kind` 必须归生产者所有 —— 见上一条。
 - **覆盖子代理。** 子代理加入父方的组装、走同一条装配瀑布，全局监听器与根作用域守卫
   都生效；开关也跟随父会话。父方通过 `toolFilter` 限制掉的工具，子代理既查不到也调不到。
 - **过滤出错时降级**：白名单一个都没匹配上就放行完整目录并告警一次 ——
@@ -172,7 +242,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.1.1
 
 ```sh
 pnpm install
-pnpm test          # 126 个测试
+pnpm test          # 164 个测试
 pnpm build         # 校验后逐字节拷贝 src/ → lib/
 ```
 

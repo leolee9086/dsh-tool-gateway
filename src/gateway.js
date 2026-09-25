@@ -27,6 +27,10 @@
  * - 可见性：`AssembleContext.agent`（`core/agent/src/runtime-types.ts:19`）
  * - 执行：`ToolExecution.agent`（`core/tools/src/index.ts:322`，DSH 自己拿它做作用域分发）
  * - 提示段落：`AssembleContext.agent`
+ *
+ * **守卫上现在有两段判断，顺序是有意义的：**先判硬禁用名单（`banFor`，来自 ban.js ——
+ * 静态名单加会话级关掉的工具），再判网关规则。硬禁用不看 `parent`，所以它连 `call_tool`
+ * 的子分发也拦得住；网关规则对子分发放行。这两段曾经分属两个插件，合并的理由见 ban.js。
  */
 import { CALL_TOOLS } from './code-tools.js'
 
@@ -135,11 +139,18 @@ export function installAssembleFilter(ctx, keepFor, enabledFor, warnOnce) {
  * @param {(agent: object|undefined) => Set<string>} keepFor 这个 agent 现在能直接调用的
  *   元工具名（理由同 {@link installAssembleFilter}）
  * @param {(agent: object|undefined) => boolean} enabledFor 这个 agent 的会话要不要施加约束
+ * @param {(execution: object) => string|undefined} banFor 硬禁用判定：静态名单，加上用户在
+ *   面板里按会话关掉的工具。它**先于**其它判据执行，返回值就是拒绝理由
  * @returns {void}
  */
-export function installGuard(ctx, keepFor, enabledFor) {
+export function installGuard(ctx, keepFor, enabledFor, banFor) {
   ctx.effect(
     () => ctx.tools.guard((execution) => {
+      // 硬禁用排在最前，而且**先于**子分发那一条。禁用的语义是「任何路径都不许」，
+      // 所以它连 call_tool 的子分发也拦 —— 这正是「禁用」与「没让它露面」的区别：
+      // 没露面只挡住模型直接调用，禁用挡住一切路径。
+      const banned = typeof banFor === 'function' ? banFor(execution) : undefined
+      if (banned !== undefined) return banned
       // 子分发（call_tool / call_tools 内部发起的调用）永远放行，而且先于其它两条判。
       // 两个理由：它不是模型直接调用；它也是这条路上最频繁的一类，而它既不需要读开关、
       // 也不需要算元工具清单。

@@ -2,8 +2,15 @@
  * 会话级开关状态：这个会话要不要施加"工具箱"行为约束。
  *
  * **默认开。** 插件装上了就是要约束行为 —— 让 agent 每次都先去工具箱里挑工具，
- * 而不是对着一份被截断的工具列表将就。"关"是用户在某个会话里的**显式覆盖**。
+ * 而不是对着一份被截断的工具列表将就。「关」是用户在某个会话里的**显式覆盖**。
  * 所以这里没有记录 == 开，`{ enabled: false }` 才是关。
+ *
+ * **一个会话记录里存两个偏好**（同一张表，一起读写，因为它们同属「这个会话怎么用工具」）：
+ *
+ * - `enabled` —— 要不要施加工具箱约束；
+ * - `disabledTools` —— 用户在面板里逐个关掉的工具名。它们由网关的守卫拒绝执行，
+ *   并且从 find_tools 的目录里摘掉，但**不**动模型可见工具表 —— 那张表在网关开着时
+ *   只有三个元工具，动它才会毁掉前缀缓存。
  *
  * **为什么要有这一层而不是直接在 host.js 里放个 Map**：开关必须跨重启活着。
  * 用户的会话是长寿命的，他给某个会话关掉网关之后重启 DSH，那个会话又开了 —— 那是 bug。
@@ -22,6 +29,7 @@
  *
  * @module dsh-tool-gateway/switch-state
  */
+import { normalizeNames } from './ban.js'
 
 /** 开关的持久化 domain 名。必须匹配 `UNIT_NAME_RE`（`/^[a-z][a-z0-9_]*$/`，不允许连字符）。 */
 export const DOMAIN_NAME = 'tool_gateway'
@@ -32,18 +40,21 @@ const TABLE_NAME = 'sessions'
 /**
  * 一条会话记录的形状校验。
  *
- * 只认 `{ enabled: boolean }`，并把结果规范化成只有这一个字段 —— 记录里多余的键
- * 不会跟着进内存，避免旧版本写下的字段在新版本里阴魂不散。
+ * 认 `{ enabled: boolean, disabledTools: string[] }`，并把结果规范化成只有这两个字段 ——
+ * 记录里多余的键不会跟着进内存，避免旧版本写下的字段在新版本里阴魂不散。
+ *
+ * `disabledTools` 缺省成空数组：加这个字段之前写下的记录只有 `enabled`，仍然要能读，
+ * 所以这是一次向后兼容的扩展，不需要动 domain 的 version。
  */
-const ENABLED_RECORD_SCHEMA = {
+const SESSION_RECORD_SCHEMA = {
   parse(value) {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-      throw new Error('tool-gateway 会话开关记录必须是一个对象')
+      throw new Error('tool-gateway 会话记录必须是一个对象')
     }
     if (typeof value.enabled !== 'boolean') {
-      throw new Error('tool-gateway 会话开关记录的 enabled 字段必须是布尔值')
+      throw new Error('tool-gateway 会话记录的 enabled 字段必须是布尔值')
     }
-    return { enabled: value.enabled }
+    return { enabled: value.enabled, disabledTools: normalizeNames(value.disabledTools) }
   },
 }
 
@@ -57,23 +68,33 @@ const DOMAIN_SPEC = {
   name: DOMAIN_NAME,
   version: 1,
   tables: {
-    [TABLE_NAME]: { valueSchema: ENABLED_RECORD_SCHEMA },
+    [TABLE_NAME]: { valueSchema: SESSION_RECORD_SCHEMA },
   },
 }
 
 /**
  * domain 用不了时的替身：行为与真身一致，只是不持久。
  *
- * @param {Map<string, boolean>} store 内存里的开关表
+ * @param {Map<string, {enabled: boolean, disabledTools: string[]}>} store 内存里的会话记录表
  * @returns {object} 与 createSwitchState 同形的句柄
  */
 function memoryOnly(store) {
+  const recordOf = (sessionId) => store.get(sessionId) ?? { enabled: true, disabledTools: [] }
   return {
     isEnabled(sessionId) {
-      return store.get(sessionId) ?? true
+      return recordOf(sessionId).enabled
+    },
+    disabledTools(sessionId) {
+      return new Set(recordOf(sessionId).disabledTools)
     },
     async setEnabled(sessionId, enabled) {
-      store.set(sessionId, enabled)
+      store.set(sessionId, { enabled, disabledTools: recordOf(sessionId).disabledTools })
+    },
+    async setToolDisabled(sessionId, name, disabled) {
+      const names = new Set(recordOf(sessionId).disabledTools)
+      if (disabled) names.add(name)
+      else names.delete(name)
+      store.set(sessionId, { enabled: recordOf(sessionId).enabled, disabledTools: [...names] })
     },
     async close() {},
   }
@@ -110,26 +131,69 @@ export async function createSwitchState(ctx, warnOnce) {
 
   const table = domain.table(TABLE_NAME)
 
+  /**
+   * 读一条会话记录，缺失的字段按默认值补全。
+   *
+   * 默认值是产品定义的，不是「读不到就猜一个」：约束默认开，关掉的工具默认为空。
+   * 补全过程写在一处，四个读接口就不会对「没有记录」给出两种答案。
+   *
+   * @param {string} sessionId 归属会话 id（见 session-key.js）
+   * @returns {{enabled: boolean, disabledTools: string[]}} 补全后的记录
+   */
+  const recordOf = (sessionId) => {
+    const stored = table.get(sessionId)
+    return {
+      enabled: stored?.enabled ?? true,
+      disabledTools: stored?.disabledTools ?? [],
+    }
+  }
+
   return {
     /**
      * 这个会话的开关是不是开着。
-     * @param {string} sessionId 归属会话 id（见 session-key.js）
+     * @param {string} sessionId 归属会话 id
      * @returns {boolean} true = 施加工具箱约束
      */
     isEnabled(sessionId) {
-      // 没有记录就是默认开 —— 这是产品定义的默认值，不是"读不到就猜一个"。
-      return table.get(sessionId)?.enabled ?? true
+      return recordOf(sessionId).enabled
+    },
+
+    /**
+     * 这个会话里被逐个关掉的工具名。
+     * @param {string} sessionId 归属会话 id
+     * @returns {Set<string>} 关掉的工具名
+     */
+    disabledTools(sessionId) {
+      return new Set(recordOf(sessionId).disabledTools)
     },
 
     /**
      * 写下一个会话的开关。总是写入显式记录（而不是删除记录回到默认）：
-     * 用户切回"开"也是一个决定，将来默认值若变化，这个会话不该跟着变。
+     * 用户切回「开」也是一个决定，将来默认值若变化，这个会话不该跟着变。
+     *
+     * 两个偏好存在同一条记录里，所以写任意一个都要把另一个原样带上 —— 这正是
+     * 「一起读写」的代价，也是它换来的一致性：不存在两个字段各写一半的中间态。
+     *
      * @param {string} sessionId 归属会话 id
      * @param {boolean} enabled 新状态
      * @returns {Promise<void>} 落盘之后 resolve
      */
     async setEnabled(sessionId, enabled) {
-      await table.put(sessionId, { enabled })
+      await table.put(sessionId, { enabled, disabledTools: recordOf(sessionId).disabledTools })
+    },
+
+    /**
+     * 开关一个工具。
+     * @param {string} sessionId 归属会话 id
+     * @param {string} name 工具名
+     * @param {boolean} disabled true = 关掉它
+     * @returns {Promise<void>} 落盘之后 resolve
+     */
+    async setToolDisabled(sessionId, name, disabled) {
+      const names = new Set(recordOf(sessionId).disabledTools)
+      if (disabled) names.add(name)
+      else names.delete(name)
+      await table.put(sessionId, { enabled: recordOf(sessionId).enabled, disabledTools: [...names] })
     },
 
     /**

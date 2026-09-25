@@ -31,7 +31,25 @@ const TOOLS = [
  * @param {number} [options.maxResults] find_tools 一次返回几条
  * @returns {object} 两个工具定义与观察点
  */
-function setup({ outcome, maxResults } = {}) {
+/**
+ * 记录 append 的会话桩。
+ *
+ * @param {object} [options] 覆盖项
+ * @param {string} [options.throwOn] 对这个事件类型抛错，用来验证"记日志失败不影响调用"
+ * @returns {object} 桩与观察点
+ */
+function stubSession({ throwOn } = {}) {
+  const events = []
+  return {
+    events,
+    append(type, data) {
+      if (type === throwOn) throw new Error('日志炸了')
+      events.push({ type, data })
+    },
+  }
+}
+
+function setup({ outcome, maxResults, session } = {}) {
   const catalog = createCatalog()
   catalog.rebuild(TOOLS)
 
@@ -55,6 +73,9 @@ function setup({ outcome, maxResults } = {}) {
     token: { token: 'tok' },
     signal: new AbortController().signal,
     deferContext: (message) => { deferred.push(message) },
+    // 不传 session 时 exec 上就没有 agent —— 与插件自己发起的调用一致，
+    // 那时子调用事件无处可记，可选链会让它安静地跳过。
+    ...(session === undefined ? {} : { agent: { session } }),
   }
   return { findTools, callTool, exec, executed, deferred }
 }
@@ -154,7 +175,10 @@ test('call_tool：非文本块经 deferContext 作为独立上下文送出', asy
   assert.equal(deferred.length, 1)
   // 手工构造的 UserMessage：形状 = Message + role:'user'。
   assert.equal(deferred[0].role, 'user')
-  assert.equal(deferred[0].source.kind, 'plugin')
+  // V4 会话的准入规则：kind 必须归生产者所有。退役的 `{ kind: 'plugin', plugin }` 会被
+  // 直接拒绝（format v4 message requires a producer-owned source kind），一个字节都不落盘。
+  assert.notEqual(deferred[0].source.kind, 'plugin')
+  assert.equal(deferred[0].source.kind, 'plugin:dsh-tool-gateway')
   assert.equal(typeof deferred[0].id, 'string')
   assert.equal(deferred[0].content.length, 1)
   assert.equal(deferred[0].content[0].type, 'image')
@@ -178,4 +202,45 @@ test('call_tool：工具没有返回内容时也给出可读的交代', async ()
   const { callTool, exec } = setup({ outcome: { isError: false, content: [] } })
   const { text } = await callTool.execute({ tool_name: 'zhihu_search', arguments: {} }, exec)
   assert.match(text, /没有返回内容/)
+})
+
+test('call_tool：子调用在会话日志里留两条事件，界面据此画它自己的卡片', async () => {
+  const session = stubSession()
+  const { callTool, exec } = setup({ session })
+  await callTool.execute({ tool_name: 'zhihu_search', arguments: { keyword: 'x' } }, exec)
+
+  assert.deepEqual(session.events.map((event) => event.type),
+    ['tool/ptc-dispatch-start', 'tool/ptc-dispatch'])
+  const [start, settled] = session.events
+  for (const event of [start, settled]) {
+    // 三个 id 都要有：tools 包的不变量会查，缺一个整条会话日志就重建失败。
+    assert.equal(event.data.rootCallId, 'call-1')
+    assert.equal(event.data.parentCallId, 'call-1')
+    assert.equal(event.data.subCallId, 'call-1:meta')
+    assert.equal(event.data.name, 'zhihu_search')
+    assert.deepEqual(event.data.arguments, { keyword: 'x' })
+  }
+  // 结算事件用的是 tool/result 自己的词汇 —— 界面走渲染原生调用的同一条路径。
+  assert.equal(settled.data.isError, false)
+  assert.deepEqual(settled.data.content, [{ type: 'text', text: '结果文本' }])
+})
+
+test('call_tool：记日志失败不影响工具调用本身', async () => {
+  const session = stubSession({ throwOn: 'tool/ptc-dispatch-start' })
+  const { callTool, exec, executed } = setup({ session })
+  const { text } = await callTool.execute({ tool_name: 'zhihu_search', arguments: {} }, exec)
+
+  assert.equal(text, '结果文本')
+  assert.equal(executed.length, 1)
+})
+
+test('call_tool：参数序列化不了时整条不记，也不编假参数', async () => {
+  const session = stubSession()
+  const { callTool, exec, executed } = setup({ session })
+  const circular = {}
+  circular.self = circular
+  await callTool.execute({ tool_name: 'zhihu_search', arguments: circular }, exec)
+
+  assert.equal(executed.length, 1, '调用本身照常走')
+  assert.equal(session.events.length, 0, '一条都不记，而不是记个占位')
 })

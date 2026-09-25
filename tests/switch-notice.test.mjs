@@ -43,14 +43,19 @@ test('两段文案不同：通知说的是"刚变了什么"，不是笼统的一
   assert.doesNotMatch(switchNoticeText(false), /已开启/)
 })
 
-test('消息形状：user 角色 + text 块 + plugin 来源', () => {
+test('消息形状：user 角色 + text 块 + 生产者拥有的来源', () => {
   const message = createSwitchNotice(true)
   assert.match(message.id, UUID_LIKE)
   // 必须是 user：这条消息要作为 user/message 进会话日志，
   // 模型可见的东西因此仍然可以从日志重建。
   assert.equal(message.role, 'user')
   assert.deepEqual(message.content, [{ type: 'text', text: switchNoticeText(true) }])
-  assert.deepEqual(message.source, { kind: 'plugin', plugin: 'dsh-tool-gateway' })
+  // V4 会话里 kind 必须归生产者所有：退役包装会被准入直接拒绝，而且不留日志
+  // （format v4 message requires a producer-owned source kind）。
+  assert.notEqual(message.source.kind, 'plugin')
+  assert.equal(message.source.kind, 'plugin:dsh-tool-gateway')
+  assert.equal(message.source.form, 'notice')
+  assert.equal(typeof message.source.summary, 'string')
 })
 
 test('每条通知一个新的 id：同 id 的两条消息会让下游投影分不清', () => {

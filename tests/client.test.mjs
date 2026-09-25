@@ -40,17 +40,30 @@ function stubReact() {
   }
 }
 
-/** 插件上下文的桩：把三类注册都记下来。 */
-function stubCtx() {
+/**
+ * 插件上下文的桩：把三类注册都记下来，并支持延迟注入（`ctx.inject`）。
+ *
+ * @param {object} [services] 延迟注入的回调里 `scope.get(name)` 能拿到什么
+ * @returns {object} 桩上下文
+ */
+function stubCtx(services = {}) {
   const effects = []
   const locales = []
   const injectedSlots = []
   const registrations = []
-  return {
+  const injected = []
+  const ctx = {
     effects,
     locales,
     injectedSlots,
     registrations,
+    injected,
+    inject(names, callback) {
+      injected.push(names)
+      // 子作用域沿用同一份记录，只是多一个 get —— 真 Cordis 也是这个形状。
+      callback({ ...ctx, get: (name) => services[name] })
+      return () => {}
+    },
     effect(fn, label) {
       effects.push(label)
       fn()
@@ -73,17 +86,18 @@ function stubCtx() {
       },
     },
   }
+  return ctx
 }
 
 /** 走一遍"加载 → factory → apply"，返回拿到的一切。 */
-function mount() {
+function mount(services = {}) {
   const spec = loadRegistration()
   const React = stubReact()
   const plugin = spec.factory((name) => {
     assert.equal(name, 'react', '客户端只允许向模块表要 react')
     return React
   })
-  const ctx = stubCtx()
+  const ctx = stubCtx(services)
   plugin.apply(ctx)
   return { spec, plugin, ctx, React }
 }
@@ -105,6 +119,32 @@ test('apply 注册了中英文案', () => {
   assert.equal(typeof ctx.locales[0].dictionaries.en.on, 'string')
 })
 
+test('面板走延迟注入：那两个服务缺席时 chip 不能跟着消失', () => {
+  const { ctx } = mount()
+  // 展开一次：数组是 vm 那个 realm 里造的，跨 realm 的 deepEqual 会因为原型不同而失败。
+  assert.deepEqual(ctx.injected.map((names) => [...names]), [['sidebarRightTabs', 'sidebarRight', 'layout']])
+  // 服务没到 → 一个面板注册都不该发生（chip 那一条照旧）。
+  assert.deepEqual(ctx.registrations.map((r) => r.options.name), ['conversation.session.header.actions'])
+})
+
+test('面板挂到右侧栏的三个座位上：类型、正文、标题、底部入口', () => {
+  const tabs = []
+  const { ctx } = mount({
+    sidebarRightTabs: { register: (definition) => { tabs.push(definition); return () => {} } },
+    sidebarRight: { openTab: () => {}, isExpanded: () => true },
+    layout: { openRightbar: () => {} },
+  })
+  assert.deepEqual(tabs.map((definition) => definition.id), ['dsh-tool-gateway:tools'])
+  // 正文与标题用同一个 key —— 那正是页签类型定义里的 id。
+  const seats = ctx.registrations.map((entry) => entry.options.name)
+  assert.ok(seats.includes('sidebar.right.pane.tab'))
+  assert.ok(seats.includes('sidebar.right.pane.tab.title'))
+  assert.ok(seats.includes('sidebar.footer.action'))
+  for (const name of ['sidebar.right.pane.tab', 'sidebar.right.pane.tab.title']) {
+    const entry = ctx.registrations.find((item) => item.options.name === name)
+    assert.equal(entry.options.key, 'dsh-tool-gateway:tools')
+  }
+})
 test('apply 把开关挂到会话标题栏那个插槽上', () => {
   const { ctx } = mount()
   assert.deepEqual(ctx.injectedSlots, ['conversation.session.header.actions'])

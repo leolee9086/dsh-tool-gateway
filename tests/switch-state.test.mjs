@@ -77,12 +77,48 @@ test('写下的开关能读回来，并且真的落进了介质', async () => {
 
   await state.setEnabled('session-a', false)
   assert.equal(state.isEnabled('session-a'), false)
-  assert.deepEqual(records.get('session-a'), { enabled: false })
+  assert.deepEqual(records.get('session-a'), { enabled: false, disabledTools: [] })
 
   await state.setEnabled('session-a', true)
   assert.equal(state.isEnabled('session-a'), true)
   // 总是写显式记录，不靠删除记录回到默认 —— 将来默认值若变化，这个会话不该跟着变。
-  assert.deepEqual(records.get('session-a'), { enabled: true })
+  assert.deepEqual(records.get('session-a'), { enabled: true, disabledTools: [] })
+})
+
+test('工具开关：写下的关掉名单能读回来，并且与总开关互不干扰', async () => {
+  const { facility, records } = stubStorage()
+  const state = await createSwitchState(ctxWith(facility), () => {})
+
+  assert.deepEqual([...state.disabledTools('session-a')], [])
+
+  await state.setToolDisabled('session-a', 'web_search_meta', true)
+  assert.deepEqual([...state.disabledTools('session-a')], ['web_search_meta'])
+  assert.deepEqual(records.get('session-a'), { enabled: true, disabledTools: ['web_search_meta'] })
+
+  // 关掉工具之后再切总开关：工具名单要原样留着。两个偏好同一条记录，
+  // 所以写任意一个都必须把另一个带上 —— 这正是它换来的一致性。
+  await state.setEnabled('session-a', false)
+  assert.equal(state.isEnabled('session-a'), false)
+  assert.deepEqual([...state.disabledTools('session-a')], ['web_search_meta'])
+
+  await state.setToolDisabled('session-a', 'web_search_meta', false)
+  assert.deepEqual([...state.disabledTools('session-a')], [])
+  assert.equal(state.isEnabled('session-a'), false, '打开一个工具不该顺手动到总开关')
+})
+
+test('加 disabledTools 之前的旧记录仍然读得出来（向后兼容，不动 domain 版本）', async () => {
+  const { facility } = stubStorage({ initial: { 'session-a': { enabled: false } } })
+  const state = await createSwitchState(ctxWith(facility), () => {})
+  assert.equal(state.isEnabled('session-a'), false)
+  assert.deepEqual([...state.disabledTools('session-a')], [])
+})
+
+test('domain 不可用时，工具开关同样降级到内存', async () => {
+  const state = await createSwitchState(ctxWith(undefined), () => {})
+  await state.setToolDisabled('session-a', 'read', true)
+  assert.equal(state.disabledTools('session-a').has('read'), true)
+  await state.setToolDisabled('session-a', 'read', false)
+  assert.equal(state.disabledTools('session-a').has('read'), false)
 })
 
 test('重启后已存的覆盖仍然生效（open 时从介质读出来）', async () => {
@@ -114,7 +150,7 @@ test('schema 拒绝非对象、拒绝 enabled 不是布尔值', async () => {
 test('schema 规范化记录：多余的键不会跟着进内存', async () => {
   const { facility, records } = stubStorage({ initial: { 'session-a': { enabled: false, legacy: 'x' } } })
   await createSwitchState(ctxWith(facility), () => {})
-  assert.deepEqual(records.get('session-a'), { enabled: false })
+  assert.deepEqual(records.get('session-a'), { enabled: false, disabledTools: [] })
 })
 
 test('storageDomain 不可用时降级到内存并告警一次', async () => {

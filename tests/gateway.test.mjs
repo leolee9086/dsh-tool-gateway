@@ -260,3 +260,39 @@ test('提示段落：文案里说清了“历史里出现过的工具名不要�
 test('提示段落：文案要求“每一次动手之前都先查”（这是网关的目的，不是省 token）', () => {
   assert.match(noticeText(keepTwo()), /每一次动手之前都先查清楚/)
 })
+
+test('守卫：硬禁用先于子分发那条判 —— call_tool 也绕不过去', () => {
+  const ctx = stubCtx()
+  const banFor = (execution) => (execution?.name === 'ask_user_question' ? 'no' : undefined)
+  installGuard(ctx, keepTwo, alwaysOn, banFor)
+  const guard = ctx.guards[0]
+
+  // 模型直接调用：拒。
+  assert.equal(guard({ name: 'ask_user_question', agent }), 'no')
+  // 子分发（call_tool / call_tools 内部发起的调用）：**一样拒**。
+  // 这正是「禁用」与「没让它露面」的区别，也是这次合并真正要保证的行为 ——
+  // 禁用的名字连元工具路由也别想搬动它。
+  assert.equal(guard({ name: 'ask_user_question', agent, parent: 'parent-token' }), 'no')
+})
+
+test('守卫：名单外的子分发照常放行（合并没有收紧网关的语义）', () => {
+  const ctx = stubCtx()
+  installGuard(ctx, keepTwo, alwaysOn, () => undefined)
+  const guard = ctx.guards[0]
+
+  assert.equal(guard({ name: 'read', agent, parent: 'parent-token' }), undefined)
+  assert.match(guard({ name: 'read', agent }), /工具调用方式已改变/)
+})
+
+test('守卫：不传 banFor 时行为与合并前完全一致', () => {
+  const ctx = stubCtx()
+  installGuard(ctx, keepTwo, alwaysOn)
+  const guard = ctx.guards[0]
+
+  assert.equal(guard({ name: 'read', agent, parent: 'parent-token' }), undefined)
+  assert.match(guard({ name: 'read', agent }), /工具调用方式已改变/)
+  // 关掉的会话里网关规则整个不生效（硬禁用如果传了，它仍然先判 —— 见上一条用例）。
+  const off = stubCtx()
+  installGuard(off, keepTwo, alwaysOff, () => undefined)
+  assert.equal(off.guards[0]({ name: 'read', agent }), undefined)
+})
