@@ -167,6 +167,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.0
 | `src/code-tools.js` | `call_tools`：把一段程序交给 PTC 运行时，只绑两个函数 |
 | `src/gateway.js` | 可见性过滤、执行守卫（**硬禁用先判**）、提示段落，都按 `keepFor(agent)` / `enabledFor(agent)` 分支 |
 | `src/ban.js` | 硬禁用名单：静态名单的判定 + 按 agent 抹掉模型可见工具表（原 dsh-tool-ban） |
+| `src/deliver-context.js` | 子调用带回来的非文本内容（图片等）怎么送到模型眼前 |
 | `src/session-key.js` | 一个 agent 的开关记在哪个会话名下（子代理跟随父） |
 | `src/switch-state.js` | 开关状态与工具名单的读写与持久化（默认：约束开、一个都不禁） |
 | `src/route.js` | 给浏览器用的 HTTP 接口：会话开关（chip）+ 这个会话的工具清单与工具开关（面板） |
@@ -211,6 +212,12 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.0
 - **不动会话历史。** 不改写、不压缩、不按历史分档、不扫会话事件判断状态。
   已经跑过一段的会话里那些直接调用 `read`、`bash` 的记录原样留着，
   说明里讲清楚了"入口变了"，模型会遵守。
+- **非文本内容（图片等）用 `agent.inject` 投递，不用 `deferContext`。** 后者把上下文并进
+  结果的 `additionalContexts`、由 agent loop 暂存进「下一步的 inbox」再以 `agent/inbox/spliced`
+  事件 splice 进会话；**实测它一次都没落地** —— 会话里从来没出现过那种事件，工具返回的图
+  只留在 `tool/ptc-dispatch` 的审计记录里（`surface=log-only`），模型永远看不到。
+  改用的 `agent.inject` 正是工具箱开关通知走的那条路，实测能到模型眼前。
+  两条通道的取舍写在 `src/deliver-context.js`。
 - **注入的消息用生产者自己的来源 kind。** 往会话里追加消息时 `source.kind` 必须是
   `plugin:dsh-tool-gateway` —— V4 起消息源归生产者所有，退役的 `{ kind: 'plugin', plugin }`
   会被会话准入直接拒绝。症状很隐蔽：那一轮在**毫秒级**失败、错误码是 `UNKNOWN`、
