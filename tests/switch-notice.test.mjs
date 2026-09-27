@@ -13,7 +13,9 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createSwitchNotice, switchNoticeText } from '../src/switch-notice.js'
+import {
+  createSwitchNotice, createToolReminder, switchNoticeText, toolReminderText,
+} from '../src/switch-notice.js'
 
 /** uuid v4 的粗匹配：只看形状，不校验版本位。 */
 const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -66,3 +68,34 @@ test('开关两种状态各自映射到对应的文案', () => {
   assert.equal(createSwitchNotice(true).content[0].text, switchNoticeText(true))
   assert.equal(createSwitchNotice(false).content[0].text, switchNoticeText(false))
 })
+
+test('提醒文案：说清是人点的、工具仍然可用，并留一个"用不上就别硬凑"的出口', () => {
+  const text = toolReminderText('everything_search', '用 Everything 查询本机文件索引')
+  assert.match(text, /everything_search/)
+  assert.match(text, /用 Everything 查询本机文件索引/)
+  // 不能读成"状态变了" —— 工具一直是可用的，提醒只是一句话。
+  assert.match(text, /不是开关变化/)
+  assert.match(text, /find_tools/)
+  // 没有出口的话，模型会为了回应提醒硬凑一次调用。
+  assert.match(text, /用不上/)
+  assert.doesNotMatch(text, /已关闭|已打开/)
+})
+
+test('提醒文案：没有描述时不塞一个空的"它的用途"', () => {
+  const text = toolReminderText('mystery', '')
+  assert.doesNotMatch(text, /它的用途：/)
+  assert.match(text, /mystery/)
+  assert.equal(toolReminderText('mystery', undefined), text)
+})
+
+test('提醒消息的形状：仍是生产者拥有的 notice，每条新 id', () => {
+  const message = createToolReminder('edit', '改文件')
+  assert.match(message.id, UUID_LIKE)
+  assert.equal(message.role, 'user')
+  assert.deepEqual(message.content, [{ type: 'text', text: toolReminderText('edit', '改文件') }])
+  assert.equal(message.source.kind, 'plugin:dsh-tool-gateway')
+  assert.equal(message.source.form, 'notice')
+  assert.match(message.source.summary, /edit/)
+  assert.notEqual(createToolReminder('edit', 'x').id, createToolReminder('edit', 'x').id)
+})
+

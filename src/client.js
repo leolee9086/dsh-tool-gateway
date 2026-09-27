@@ -118,6 +118,20 @@ window.__ModuleLoader__.load({
   font-size:11px;line-height:16px;font-family:inherit;
   background:var(--dsw-alias-fill-tertiary, rgba(0,0,0,.06));
   color:var(--dsw-alias-label-secondary, #666)}
+.dsh-tool-gateway-panel-row + .dsh-tool-gateway-panel-row{
+  border-top:1px dashed var(--dsw-alias-border-l2, rgba(0,0,0,.12))}
+.dsh-tool-gateway-panel-remind{flex:none;appearance:none;border:none;background:transparent;font:inherit;
+  font-size:11px;line-height:16px;padding:2px 6px;border-radius:4px;cursor:pointer;white-space:nowrap;
+  color:var(--dsw-alias-label-tertiary, #999);opacity:.45;
+  transition:opacity .12s,color .12s,background .12s}
+.dsh-tool-gateway-panel-row:hover .dsh-tool-gateway-panel-remind,
+.dsh-tool-gateway-panel-remind:focus-visible{opacity:1}
+.dsh-tool-gateway-panel-remind:hover:not(:disabled){
+  background:var(--dsw-alias-fill-tertiary, rgba(0,0,0,.06));
+  color:var(--dsw-alias-label-primary, #111)}
+.dsh-tool-gateway-panel-remind:disabled{cursor:default;opacity:.3}
+.dsh-tool-gateway-panel-remind[data-sent="true"]{opacity:1;
+  color:var(--dsw-alias-state-success-primary, #22c55e)}
 .dsh-tool-gateway-panel-note{padding:16px 12px;font-size:12px;line-height:1.7;
   color:var(--dsw-alias-label-secondary, #666)}
 .dsh-tool-gateway-panel-note[data-error="true"]{color:var(--dsw-alias-state-error-primary, #ef4444)}
@@ -261,6 +275,8 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
       const [query, setQuery] = React.useState('')
+      // 点过「提醒」的工具。纯界面记忆：宿主那边没有状态可读，也不该有。
+      const [reminded, setReminded] = React.useState(() => new Set())
       // 面板可能被重复打开/关闭，用代际号作废在途请求的回调。
       const generation = React.useRef(0)
 
@@ -316,6 +332,36 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 点「提醒」：让模型重新看一眼这个工具。
+       *
+       * 与开关不同，它**不改任何状态**，所以回来之后不重读清单；只把这一行标成已提醒，
+       * 让用户知道这条消息确实发出去了。
+       *
+       * @param {string} tool 工具名
+       * @returns {Promise<void>} 界面已更新（或已记下失败原因）
+       */
+      const remindTool = async (tool) => {
+        if (busy || sessionId === null) return
+        setBusy(true)
+        try {
+          const response = await fetch(ROUTE, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId, tool, remind: true }),
+          })
+          const body = await response.json().catch(() => ({}))
+          if (!response.ok || body?.ok !== true) throw new Error(failureText(body, response.status))
+          setReminded((previous) => new Set(previous).add(tool))
+          setError(null)
+        } catch (reason) {
+          setError(String(reason?.message ?? reason))
+        } finally {
+          setBusy(false)
+        }
+      }
+
       const needle = query.trim().toLowerCase()
       const rows = data === null ? [] : data.tools.filter((tool) => needle === ''
         || String(tool.name).toLowerCase().includes(needle)
@@ -357,7 +403,17 @@ window.__ModuleLoader__.load({
           tool.description
             ? React.createElement('div', { className: 'dsh-tool-gateway-panel-desc' }, tool.description)
             : null)
-        return React.createElement('div', { className: 'dsh-tool-gateway-panel-row', key: tool.name }, knob, text)
+        const sent = reminded.has(tool.name)
+        const remindButton = React.createElement('button', {
+          type: 'button',
+          className: 'dsh-tool-gateway-panel-remind',
+          'data-sent': String(sent),
+          disabled: busy || sessionId === null,
+          title: sent ? '已提醒过，再点一次会再发一条' : '提醒模型：这个工具可能对当前任务有用',
+          'aria-label': '提醒模型 ' + tool.name + ' 可能有用',
+          onClick: () => { void remindTool(tool.name) },
+        }, sent ? '已提醒' : '提醒')
+        return React.createElement('div', { className: 'dsh-tool-gateway-panel-row', key: tool.name }, knob, text, remindButton)
       }
 
       // 正文用显式的数组拼，不写嵌套三元：哪一段在什么条件下出现，一眼能读出来。

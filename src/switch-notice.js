@@ -96,6 +96,46 @@ export function createToolNotice(tool, disabled) {
 }
 
 /**
+ * 用户在面板上点「提醒」时的通知正文。
+ *
+ * 与上面两条的分工一样：那两条说的是「什么变了」，这条说的是「去看看这个」。
+ * 它不改任何状态 —— 工具仍然是开的、名单一个字没动，所以正文里不能让模型以为
+ * 出了什么变故。要说清是**人的意思**，并给它一个「对不上就别硬用」的出口。
+ *
+ * @param {string} tool 工具名
+ * @param {string} description 这个工具的用途（宿主给的目录描述）
+ * @returns {string} 给模型看的通知
+ */
+export function toolReminderText(tool, description) {
+  const lines = [
+    '## 用户提醒：\`' + tool + '\` 可能有用',
+    '',
+    '用户刚刚在工具箱面板点了这个工具的「提醒」。这不是开关变化 —— 工具一直是可用的，',
+    '他只是觉得它对**你当前正在做的事**可能派得上用场，让你重新看它一眼。',
+  ]
+  if (typeof description === 'string' && description !== '') {
+    lines.push('', '它的用途：' + description)
+  }
+  lines.push(
+    '',
+    '对得上就用：先用 \`find_tools\` 查它的完整参数，再用 \`call_tool\` 调用。',
+    '确实用不上就说一句为什么用不上，别为了回应这条提醒去硬凑一次调用。',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * 造「用户提醒某个工具可能有用」的通知消息。
+ *
+ * @param {string} tool 工具名
+ * @param {string} description 这个工具的用途
+ * @returns {object} 可以直接交给 `agent.inject()` 的消息
+ */
+export function createToolReminder(tool, description) {
+  return notice(toolReminderText(tool, description), '用户提醒工具可能有用：' + tool)
+}
+
+/**
  * 造那条通知消息。
  *
  * @param {boolean} enabled 切换之后的状态

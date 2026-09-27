@@ -26,7 +26,7 @@
  */
 
 import { ownerSessionId, parentLookup } from './session-key.js'
-import { createSwitchNotice, createToolNotice } from './switch-notice.js'
+import { createSwitchNotice, createToolNotice, createToolReminder } from './switch-notice.js'
 
 /** 路由路径。`/api/` 前缀跟 DSH web 自己的路由保持一致。 */
 export const ROUTE = '/api/tool-gateway'
@@ -215,6 +215,17 @@ export function createGatewayRoute(ctx, state, helpers = {}) {
           throw Object.assign(new Error('请求体必须是一个 JSON 对象'), { status: 400 })
         }
         const { ownerId, agent } = resolveOwner(ctx, requireSessionId(parsed.sessionId))
+
+        // 形式三：用户点「提醒」——让模型重新看一眼某个工具。**不改任何状态**，
+        // 只发一条消息。它必须排在开关那一支前面：两个 form 都带 tool 字段，
+        // 先认 remind 才不会被当成一次开关请求。
+        if (parsed.remind === true) {
+          const tool = requireToolName(parsed.tool)
+          const entry = listTools(agent).find((item) => item.name === tool)
+          agent.inject(createToolReminder(tool, entry?.description ?? ''))
+          json(res, 200, { ok: true, tool, reminded: true })
+          return
+        }
 
         // 形式二：开关单个工具。两个 form 的字段互不重叠（一个给 enabled、一个给 tool），
         // 所以先判它不影响下面对 enabled 的校验。
