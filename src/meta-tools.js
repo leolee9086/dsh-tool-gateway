@@ -208,6 +208,66 @@ export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveS
  *   传进来，本模块不需要认识实现它们的模块
  * @returns {object[]} 两个工具定义，按 [find_tools, call_tool] 顺序
  */
+/** find_tools 的输出详略，从最省到最全。 */
+export const DETAIL_LEVELS = ['name', 'brief', 'params', 'full']
+
+/** 没指定 detail 时给到最全 —— 与这个参数出现之前的行为一致。 */
+const DEFAULT_DETAIL = 'full'
+
+/**
+ * 取一句摘要：描述里的第一句。
+ *
+ * 参数清单那一档要的是"够挑就行"的密度，整段描述会把清单冲散。
+ *
+ * @param {unknown} text 原始描述
+ * @returns {string} 第一句（给不出就是空串）
+ */
+export function firstSentence(text) {
+  if (typeof text !== 'string') return ''
+  return (text.split(/[。\n]/)[0] ?? '').trim()
+}
+
+/**
+ * 把一个 JSON Schema 的顶层参数摊成清单行。
+ *
+ * 只走一层：网关面向的动作是"挑参数"，嵌套结构留给 full 那一档看原文。
+ *
+ * @param {unknown} parameters 工具的 parameters schema
+ * @returns {string[]} 清单行（没有可用参数就是空数组）
+ */
+export function parameterLines(parameters) {
+  const properties = parameters?.properties
+  if (typeof properties !== 'object' || properties === null) return []
+  const required = new Set(Array.isArray(parameters.required) ? parameters.required : [])
+  const lines = ['  参数：']
+  for (const [name, spec] of Object.entries(properties)) {
+    const type = typeof spec?.type === 'string' ? spec.type : 'any'
+    const note = firstSentence(spec?.description)
+    lines.push(`    - ${name}（${required.has(name) ? '必填' : '可选'}，${type}）${note === '' ? '' : '：' + note}`)
+  }
+  return lines
+}
+
+/**
+ * 按详略档位渲染一个工具。
+ *
+ * @param {{name: string, description?: string, parameters?: unknown}} entry 工具条目
+ * @param {string} detail 档位（{@link DETAIL_LEVELS} 之一）
+ * @returns {string[]} 若干行
+ */
+export function toolLines(entry, detail) {
+  if (detail === 'name') return [`- ${entry.name}`]
+  const description = typeof entry.description === 'string' ? entry.description : ''
+  const head = description === '' ? `- ${entry.name}` : `- ${entry.name} —— ${description}`
+  if (detail === 'params') return [head, ...parameterLines(entry.parameters)]
+  if (detail === 'full' && entry.parameters !== undefined) {
+    return [head, '  参数 schema：', '  ```json',
+      ...JSON.stringify(entry.parameters, null, 2).split('\n').map((line) => '  ' + line),
+      '  ```']
+  }
+  return [head]
+}
+
 export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults = DEFAULT_MAX_RESULTS, siblings = [] }) {
   /** 不能通过 call_tool 调用的名字：两个元工具自己，加上接线层告知的兄弟元工具。 */
   const blocked = new Set([FIND_TOOLS, CALL_TOOL, ...siblings])
@@ -231,19 +291,41 @@ export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults
       '',
       '本会话的工具入口是元工具：先用这里查清楚，再用 call_tool 调用。',
       '其余工具不直接出现在工具表里 —— 它们仍然可用，只是要先查。',
-      '支持中文、英文、拼音全拼（zhihu）和拼音首字母查询。',
       '',
-      '用法：传 query 拿到匹配工具的**完整参数 schema**，然后用 call_tool 调用。',
-      '例：find_tools({"query":"搜索"}) → 拿到 zhihu_search 的参数，再 call_tool({"tool_name":"zhihu_search","arguments":{...}})。',
+      '两种查法，一次只给一个：',
+      '- query：模糊检索。工具名、用途、拼音全拼或首字母都行，返回最像的几个；',
+      '- names：按**确切名字**取，一个或多个。不检索、不猜 —— 对不上就直说没有。',
       '',
-      '查询为空或结果不理想时换个说法再查；工具确实存在但没搜到时，可以直接按名字 call_tool。',
+      'detail 决定给多少（默认 full）：',
+      '- name：只有名字；',
+      '- brief：名字 + 一句描述；',
+      '- params：再加参数清单（名字、类型、必填、一句说明）；',
+      '- full：完整参数 schema。',
+      '',
+      '省 token 的用法：先 find_tools({"detail":"name"}) 空手要一份名字清单，再挑真正要用的那几个',
+      '按 names 取 params 或 full —— 不必把所有工具的完整 schema 都读一遍。',
+      '',
+      '例：find_tools({"query":"搜索"})；find_tools({"names":["read","write"],"detail":"params"})。',
     ].join('\n'),
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: '查询词：工具名、用途描述，或它的拼音' },
+        query: {
+          type: 'string',
+          description: '模糊检索词：工具名、用途描述，或它的拼音。与 names 二选一',
+        },
+        names: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '按确切名字取，一个或多个。确定性查找：不检索、不猜，对不上就直说没有。与 query 二选一',
+        },
+        detail: {
+          type: 'string',
+          enum: [...DETAIL_LEVELS],
+          description: '给多少：name 只给名字（空手给它就是列一份名字清单）；brief 再加一句描述；'
+            + 'params 再加参数清单；full 给完整参数 schema（默认）',
+        },
       },
-      required: ['query'],
       additionalProperties: false,
     },
     output: {
@@ -252,26 +334,78 @@ export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults
     },
     async execute(args, exec) {
       const query = typeof args?.query === 'string' ? args.query.trim() : ''
-      if (query.length === 0) {
-        return { text: '请提供 query。例如 find_tools({"query":"搜索"})。' }
+      const wanted = Array.isArray(args?.names)
+        ? args.names
+          .filter((entry) => typeof entry === 'string' && entry.trim() !== '')
+          .map((entry) => entry.trim())
+        : []
+      const detail = DETAIL_LEVELS.includes(args?.detail) ? args.detail : DEFAULT_DETAIL
+
+      if (query !== '' && wanted.length > 0) {
+        return { text: 'query 与 names 只能给一个：前者是检索，后者是按名字确定地取。' }
       }
-      const hits = resolveCatalog(exec?.agent).search(query, maxResults)
+
+      const schemas = schemaMap(exec?.agent)
+      const catalog = resolveCatalog(exec?.agent)
+
+      // 按确切名字取。不检索、不打分 —— 对不上就如实说没有，不去推荐"最像的"。
+      if (wanted.length > 0) {
+        const found = []
+        const missing = []
+        for (const name of wanted) {
+          if (!catalog.has(name)) {
+            missing.push(name)
+            continue
+          }
+          const schema = schemas.get(name)
+          found.push({ name, description: schema?.description ?? '', parameters: schema?.parameters })
+        }
+        const lines = found.flatMap((entry) => toolLines(entry, detail))
+        if (found.length > 0) {
+          lines.push('', '调用方式：call_tool({"tool_name":"<工具名>","arguments":{...}})。')
+        }
+        if (missing.length > 0) {
+          lines.push('', `没有这些工具：${missing.join('、')}。`
+            + '名字要精确（也可以拿 query 模糊找一个）；被本会话关掉的工具同样不在目录里。')
+        }
+        return { text: lines.join('\n') }
+      }
+
+      // 空手 + 只要名字 = 列一份清单。先看有哪些、再挑要看的，比一次全要省。
+      if (query === '') {
+        if (detail !== 'name') {
+          return {
+            text: '请给 query（模糊检索）或 names（按确切名字取）。'
+              + '只想看有哪些工具，就用 detail="name" 空手要一份名字清单。',
+          }
+        }
+        const all = catalog.names()
+        if (all.length === 0) return { text: '这个会话的目录里没有工具。' }
+        return { text: [`目录里有 ${all.length} 个工具：`, '', ...all.map((name) => `- ${name}`)].join('\n') }
+      }
+
+      const hits = catalog.search(query, maxResults)
       if (hits.length === 0) {
         return {
           text: `没有匹配「${query}」的工具。换个说法再查（可以试工具名、用途，或拼音）；`
-            + '如果你已经知道确切的工具名，直接用 call_tool 调用它。',
+            + '已经知道确切名字的话用 names 直接取，或者直接 call_tool 调它。',
         }
       }
-      const schemas = schemaMap(exec?.agent)
-      const lines = [`匹配「${query}」的工具 ${hits.length} 个：`]
-      for (const hit of hits) {
+      const entries = hits.map((hit) => {
         const schema = schemas.get(hit.name)
-        lines.push('', `### ${hit.name}`, hit.description || '（无描述）')
-        if (schema?.parameters !== undefined) {
-          lines.push('参数 schema：', '```json', JSON.stringify(schema.parameters, null, 2), '```')
+        return {
+          name: hit.name,
+          description: hit.description || schema?.description || '',
+          parameters: schema?.parameters,
         }
-      }
-      lines.push('', '调用方式：call_tool({"tool_name":"<工具名>","arguments":{...}})。')
+      })
+      const lines = [
+        `匹配「${query}」的工具 ${entries.length} 个：`,
+        '',
+        ...entries.flatMap((entry) => toolLines(entry, detail)),
+        '',
+        '调用方式：call_tool({"tool_name":"<工具名>","arguments":{...}})。',
+      ]
       return { text: lines.join('\n') }
     },
   }

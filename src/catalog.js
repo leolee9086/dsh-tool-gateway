@@ -180,6 +180,33 @@ export function createCatalog() {
       }))
     },
 
+    /**
+     * 这个名字在不在目录里。
+     *
+     * 与 `search` 的区别是它**确定性**：不检索、不打分，名字对上才算。按确切名字取
+     * schema 那条路要靠它挡掉"注册表里有、但这个会话关掉了"的名字 —— 那种工具调不动
+     * （守卫拒绝），不该在查询结果里装作可用。
+     *
+     * @param {string} name 工具名
+     * @returns {boolean} 是否在这个目录里
+     */
+    has(name) {
+      return index.has(name)
+    },
+
+    /**
+     * 目录里的全部工具名，按字母序。
+     *
+     * 给 find_tools 的"只列名字"那一档用：先要一份清单、再挑真正要看的几个，
+     * 比一次把所有工具的完整 schema 都要回去省得多。只读索引自己的 id 集合，
+     * 不另外维护一份可能跟它跑偏的名单。
+     *
+     * @returns {string[]} 工具名
+     */
+    names() {
+      return [...index.documentIds].map(String).sort()
+    },
+
     /** @returns {number} 索引里的工具条数 */
     size() {
       return index.documentCount

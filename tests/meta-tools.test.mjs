@@ -121,7 +121,8 @@ test('find_tools：maxResults 生效', async () => {
   const ctx = { tools: { schemas: () => [], get: () => undefined, execute: async () => ({}) } }
   const [findTools] = createMetaTools({ ctx, resolveCatalog: () => catalog, maxResults: 3 })
   const { text } = await findTools.execute({ query: '搜索' }, { callId: 'c', token: {}, signal: new AbortController().signal })
-  assert.equal((text.match(/^### /gm) ?? []).length, 3)
+  // 每个工具占一行，顶格以 "- " 开头（参数清单与 JSON 都是缩进的）。
+  assert.equal((text.match(/^- search_/gm) ?? []).length, 3)
 })
 
 test('call_tool：走注册表的执行入口，并把自己标成子分发', async () => {
