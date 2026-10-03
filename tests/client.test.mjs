@@ -196,3 +196,29 @@ test('组件在拿到 sessionId 之前不发请求', () => {
     globalThis.fetch = originalFetch
   }
 })
+
+test('自动重试只吃"会自己好"的失败', () => {
+  const { plugin } = mount()
+  const { retryable } = plugin.apply.retryPolicy
+  // 会话还没挂到宿主上（404）、宿主一时不可用（5xx）、请求根本没发出去（0）
+  assert.equal(retryable(0), true)
+  assert.equal(retryable(404), true)
+  assert.equal(retryable(500), true)
+  assert.equal(retryable(503), true)
+  // 身份与请求本身的问题：再问多少次都是同一个答案，重试只会拖长一次没意义的等待。
+  assert.equal(retryable(400), false)
+  assert.equal(retryable(401), false)
+  assert.equal(retryable(403), false)
+  assert.equal(retryable(405), false)
+})
+
+test('退避是一串严格递增的正数', () => {
+  const { plugin } = mount()
+  const { delays } = plugin.apply.retryPolicy
+  assert.ok(delays.length > 0, '至少要重试一次，否则等于没做自动重试')
+  let previous = 0
+  for (const delay of delays) {
+    assert.ok(Number.isFinite(delay) && delay > previous, `退避要递增：${delay} 落在 ${previous} 之后`)
+    previous = delay
+  }
+})
