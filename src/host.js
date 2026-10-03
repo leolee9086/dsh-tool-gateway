@@ -177,8 +177,12 @@ export async function apply(ctx, config = {}) {
    * 索引与可见名字集共用同一份 `ctx.tools.schemas()` 的结果 —— 那个调用要把注册表里
    * 每个定义投影成 schema，在装配与守卫两条热路径上不该走两遍。
    *
+   * 同一份结果还要给出「按名字取 schema」—— 派发子调用时要用（见下面 resolveSchema），
+   * 而投影成本已经付过了，没有理由为它再算一遍。
+   *
    * @param {object|undefined} agent 目标 agent
-   * @returns {{ catalog: object, names: Set<string> }} 目录索引与可见工具名
+   * @returns {{ catalog: object, names: Set<string>, schemas: Map<string, object> }}
+   *   目录索引、可见工具名、按名字索引的 schema
    */
   const viewOf = (agent) => {
     // 诊断路径的装配没有 agent（`AssembleContext.agent` 的 JSDoc 写着
@@ -188,7 +192,11 @@ export async function apply(ctx, config = {}) {
       const schemas = ctx.tools.schemas()
       const catalog = createCatalog()
       catalog.rebuild(schemas)
-      return { catalog, names: new Set(schemas.map((schema) => schema.name)) }
+      return {
+        catalog,
+        names: new Set(schemas.map((schema) => schema.name)),
+        schemas: new Map(schemas.map((schema) => [schema.name, schema])),
+      }
     }
     const cached = views.get(agent)
     if (cached !== undefined && cached.generation === generation && cached.prefs === prefs) return cached
@@ -205,12 +213,26 @@ export async function apply(ctx, config = {}) {
       prefs,
       catalog,
       names: new Set(schemas.map((schema) => schema.name)),
+      schemas: new Map(schemas.map((schema) => [schema.name, schema])),
     }
     views.set(agent, view)
     return view
   }
 
   const resolveCatalog = (agent) => viewOf(agent).catalog
+
+  /**
+   * 按名字取某个 agent 看得见的工具 schema。
+   *
+   * 派发子调用时把它交给注册表（见 meta-tools.js 的 invokeTool）：逐调用审查靠它回答
+   * "这一步要执行什么"，缺了就只能在那次调用执行之前拒掉。走 viewOf 是为了跟装配、
+   * 守卫共用同一份投影结果 —— 那份成本没必要为每一次子调用再付。
+   *
+   * @param {object|undefined} agent 目标 agent
+   * @param {string} name 工具名
+   * @returns {object|undefined} 不在这个 agent 的可见集里时是 undefined
+   */
+  const resolveSchema = (agent, name) => viewOf(agent).schemas.get(name)
 
   /**
    * 这个 agent 现在能不能用 `call_tools`。

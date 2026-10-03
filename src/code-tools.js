@@ -245,9 +245,11 @@ async function approveEscalation(request, approval) {
  *
  * @param {object} options 依赖
  * @param {object} options.ctx 插件上下文（用来读 `ctx.ptcRuntime` 与注册表）
+ * @param {(agent: object|undefined, name: string) => object|undefined} [options.resolveSchema]
+ *   按名字取工具 schema，转交给 invokeTool —— 派发出去的那一跳要带上它（见 meta-tools.js）
  * @returns {object[]} 一个工具定义
  */
-export function createCodeTools({ ctx }) {
+export function createCodeTools({ ctx, resolveSchema }) {
   /** 读运行时，读不到就返回 undefined。schema 投影时只能这么读 —— 不能抛。 */
   const peekRuntime = () => ctx.get('ptcRuntime')
 
@@ -411,6 +413,7 @@ export function createCodeTools({ ctx }) {
           args: rawArgs ?? {},
           exec,
           callIdSuffix: `code:${++dispatches}`,
+          resolveSchema,
           signal: runController.signal,
         })
         flights.add(flight)

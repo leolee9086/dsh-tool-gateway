@@ -111,6 +111,15 @@ function loggableArgs(args) {
  *
  * 两条事件必须在打开的 turn 内 append（tools 包的不变量会查），而工具执行本来就
  * 发生在 turn 里，所以这里不用额外判断。
+ *
+ * **派发出去的那一跳要带上目标工具自己的 schema。** 这是 `ToolExecutionInput.schema`
+ * 的契约：内置 PTC 派发 inner call 时带着它（core/tools/src/ptc.ts:550），逐调用审查
+ * （Auto review）靠它回答"这一步要执行什么"，缺了就只能在 body 之前拒绝 ——
+ * 它要求 `exec.schema.name === exec.name`（auto-review/src/index.ts:342）。
+ * 冻结由生产者负责，所以这里给一份冻结的浅拷贝，不去冻注册表里那份共享对象。
+ *
+ * 接线层没接上 `resolveSchema` 时就不带：那是这条能力没到位，行为退回未带 schema，
+ * 而不是拿一个假 schema 顶上。
 
  * @param {object} options 依赖
  * @param {object} options.ctx 插件上下文（用来读注册表）
@@ -121,12 +130,19 @@ function loggableArgs(args) {
  *   所以后缀要能区分开（带上序号），否则会话日志里会挤出一串同 id 的调用
  * @param {AbortSignal} [options.signal] 子调用的取消信号，缺省用 `exec.signal`。
  *   call_tools 传的是它自己那次运行的开关：程序结束时好把还在飞的子调用一块停掉
+ * @param {(agent: object|undefined, name: string) => object|undefined} [options.resolveSchema]
+ *   按名字取这个 agent 看得见的工具 schema，接线层注入（通常复用它的视图缓存）
  * @returns {Promise<{ text: string, context: object|undefined, isError: boolean }>} 结果
  */
-export async function invokeTool({ ctx, name, args, exec, callIdSuffix, signal = exec.signal }) {
+export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveSchema, signal = exec.signal }) {
   const subCallId = `${String(exec.callId)}:${callIdSuffix}`
   const rootCallId = exec.rootCallId ?? exec.callId
   const logged = loggableArgs(args)
+
+  // 审查者要的是"这一步要执行什么"：带上目标工具自己的 schema，且与 name 一致。
+  // 注册表那份 schema 是共享的，冻一个浅拷贝，不动它。
+  const resolved = resolveSchema === undefined ? undefined : resolveSchema(exec?.agent, name)
+  const schema = resolved === undefined ? undefined : Object.freeze({ ...resolved })
 
   /**
    * 往会话日志里记一条子调用事件。
@@ -157,6 +173,7 @@ export async function invokeTool({ ctx, name, args, exec, callIdSuffix, signal =
     callId: subCallId,
     rootCallId: exec.rootCallId,
     name,
+    ...(schema === undefined ? {} : { schema }),
     arguments: args,
     ...(exec?.agent === undefined ? {} : { agent: exec.agent }),
     parent: exec.token,
@@ -191,7 +208,7 @@ export async function invokeTool({ ctx, name, args, exec, callIdSuffix, signal =
  *   传进来，本模块不需要认识实现它们的模块
  * @returns {object[]} 两个工具定义，按 [find_tools, call_tool] 顺序
  */
-export function createMetaTools({ ctx, resolveCatalog, maxResults = DEFAULT_MAX_RESULTS, siblings = [] }) {
+export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults = DEFAULT_MAX_RESULTS, siblings = [] }) {
   /** 不能通过 call_tool 调用的名字：两个元工具自己，加上接线层告知的兄弟元工具。 */
   const blocked = new Set([FIND_TOOLS, CALL_TOOL, ...siblings])
 
@@ -297,7 +314,7 @@ export function createMetaTools({ ctx, resolveCatalog, maxResults = DEFAULT_MAX_
         }
       }
       const { text, context } = await invokeTool({
-        ctx, name, args: args?.arguments ?? {}, exec, callIdSuffix: 'meta',
+        ctx, name, args: args?.arguments ?? {}, exec, callIdSuffix: 'meta', resolveSchema,
       })
       deliverContext(exec, context)
       return { text }
