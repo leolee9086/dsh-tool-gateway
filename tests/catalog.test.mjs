@@ -111,3 +111,45 @@ test('增量：upsert 顶替同名、remove 按 id 字符串删、size 跟着变
   // 删不存在的名字不该抛（注册表可能在别处已经摘掉了它）。
   catalog.remove('never_existed')
 })
+
+test('names 列出目录里的全部名字，按字母序；重建换掉整份名单', () => {
+  const catalog = createCatalog()
+  catalog.rebuild([{ name: 'write' }, { name: 'read' }, { name: 'bash' }])
+  assert.deepEqual(catalog.names(), ['bash', 'read', 'write'])
+
+  catalog.rebuild([{ name: 'read' }])
+  assert.deepEqual(catalog.names(), ['read'], '重建是换一份，不是往上叠')
+})
+
+test('has 是确定性的：名字对上才算，不做模糊匹配', () => {
+  const catalog = createCatalog()
+  catalog.rebuild([{ name: 'zhihu_search', description: '知乎站内搜索' }])
+
+  assert.equal(catalog.has('zhihu_search'), true)
+  // 这条是 has 与 search 的分界：检索会命中它，按名字取不该。
+  assert.equal(catalog.has('zhihu'), false)
+  assert.equal(catalog.search('zhihu', 5).length > 0, true, 'search 命中它，正说明 has 不是检索')
+  assert.equal(catalog.has(''), false)
+})
+
+test('upsert 与 remove 会同步名字清单', () => {
+  const catalog = createCatalog()
+  catalog.rebuild([{ name: 'read' }])
+
+  catalog.upsert({ name: 'write' })
+  assert.deepEqual(catalog.names(), ['read', 'write'])
+  assert.equal(catalog.has('write'), true)
+
+  // 同名顶替不该在清单里多出一条。
+  catalog.upsert({ name: 'write', description: '换过的描述' })
+  assert.deepEqual(catalog.names(), ['read', 'write'])
+
+  catalog.remove('read')
+  assert.deepEqual(catalog.names(), ['write'])
+  assert.equal(catalog.has('read'), false)
+
+  // 删不存在的名字，清单也不该变。
+  catalog.remove('never_existed')
+  assert.deepEqual(catalog.names(), ['write'])
+})
+
