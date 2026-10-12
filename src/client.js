@@ -130,6 +130,9 @@ window.__ModuleLoader__.load({
 .dsh-tool-gateway-panel-search{flex:1;min-width:0;height:28px;padding:0 8px;border-radius:6px;font:inherit;
   font-size:12px;background:transparent;color:var(--dsw-alias-label-primary, #111);
   border:1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.1))}
+.dsh-tool-gateway-panel-select{flex:1;min-width:0;height:28px;padding:0 6px;border-radius:6px;font:inherit;
+  font-size:12px;background:transparent;color:var(--dsw-alias-label-primary, #111);
+  border:1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.1))}
 .dsh-tool-gateway-panel-count{flex:none;font-size:12px;white-space:nowrap;
   color:var(--dsw-alias-label-secondary, #666)}
 .dsh-tool-gateway-panel-list{flex:1;min-height:0;overflow:auto;padding:6px 0}
@@ -348,12 +351,22 @@ window.__ModuleLoader__.load({
     /** 侧栏底部入口按钮的位置：排在「搜索」后面。 */
     const PANEL_ACTION_ORDER = 62
 
+    /** 搜索输入停下来多久之后才发请求（毫秒）。每敲一个字母都发一次会刷出一串请求。 */
+    const SEARCH_DEBOUNCE_MS = 250
+
+    /** 面板一页显示多少条。与宿主侧的默认页长对齐。 */
+    const PAGE_SIZE = 200
+
     /**
      * 面板正文。
      *
-     * 读 `GET /api/tool-gateway?scope=global` 拿工具清单与关闭名单；每次切换都重读一遍。
+     * 读 `GET /api/tool-gateway` 拿**当前这一页**的工具、分组和总数；每次切换都重读一遍。
      * **权威状态在宿主侧**：这里不乐观更新、不推断、不缓存 —— 界面上的一点延迟换来的是
      * 「屏幕上显示的一定是真的」。
+     *
+     * **过滤与分页都由宿主做**（见 src/route.js 的 filterTools）：面板里过滤的话，
+     * 用户搜到的只是当前这一页里的匹配项，而计数是全量数字 —— 两个数字对不上时，
+     * 用户会以为自己要的工具丢了。
      *
      * @returns {object} React 元素
      */
@@ -364,31 +377,54 @@ window.__ModuleLoader__.load({
       const [data, setData] = React.useState(null)
       const [error, setError] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
+      // 两个 query：`query` 是输入框里的字，`applied` 是已经发给宿主的那一份。
+      // 分开是因为搜索要防抖 —— 打字快的时候不该每敲一个字母就发一次请求。
       const [query, setQuery] = React.useState('')
+      const [applied, setApplied] = React.useState('')
+      // 组筛选：空串是「全部工具」，否则是组的 id。
+      const [scope, setScope] = React.useState('')
+      const [offset, setOffset] = React.useState(0)
       // 点过「提醒」的工具。纯界面记忆：宿主那边没有状态可读，也不该有。
       const [reminded, setReminded] = React.useState(() => new Set())
       // 面板可能被重复打开/关闭，用代际号作废在途请求的回调。
       const generation = React.useRef(0)
 
+      // 防抖：输入停下来之后才把它交给 `applied`，并回到第一页 ——
+      // 换了个搜索词还停在第五页，用户会看到一片空白，然后以为自己搜错了。
+      React.useEffect(() => {
+        if (query === applied) return undefined
+        const timer = setTimeout(() => {
+          setApplied(query)
+          setOffset(0)
+        }, SEARCH_DEBOUNCE_MS)
+        return () => clearTimeout(timer)
+      }, [query, applied])
+
       const load = React.useCallback(async () => {
         if (sessionId === null) return
         const mine = ++generation.current
+        const params = new URLSearchParams({ sessionId, offset: String(offset) })
+        if (applied.trim() !== '') params.set('query', applied.trim())
+        if (scope !== '') params.set('group', scope)
         try {
-          const response = await fetch(
-            `${ROUTE}?sessionId=${encodeURIComponent(sessionId)}`,
-            { credentials: 'same-origin' },
-          )
+          const response = await fetch(`${ROUTE}?${params}`, { credentials: 'same-origin' })
           const body = await response.json().catch(() => ({}))
           if (generation.current !== mine) return
           if (!response.ok || body?.ok !== true) throw new Error(failureText(body, response.status))
-          // 每个工具自己带 disabled（宿主按这个会话算好的），前端不再自己对照名单。
-          setData({ tools: Array.isArray(body.tools) ? body.tools : [] })
+          // 每个工具自己带 enabled（宿主按这个会话算好的），前端不再自己对照名单。
+          setData({
+            tools: Array.isArray(body.tools) ? body.tools : [],
+            groups: Array.isArray(body.groups) ? body.groups : [],
+            total: Number.isSafeInteger(body.total) ? body.total : 0,
+            offset: Number.isSafeInteger(body.offset) ? body.offset : 0,
+            limit: Number.isSafeInteger(body.limit) && body.limit > 0 ? body.limit : PAGE_SIZE,
+          })
           setError(null)
         } catch (reason) {
           if (generation.current !== mine) return
           setError(String(reason?.message ?? reason))
         }
-      }, [sessionId])
+      }, [sessionId, offset, applied, scope])
 
       React.useEffect(() => {
         void load()
@@ -396,31 +432,54 @@ window.__ModuleLoader__.load({
       }, [load])
 
       /**
-       * 开关一个工具。写完重读一次，而不是就地改本地状态。
+       * 发一次写请求，成功后重读当前页。
        *
-       * @param {string} tool 工具名
-       * @param {boolean} next true = 关掉它
-       * @returns {Promise<void>} 界面已更新（或已记下失败原因）
+       * 几个状态变更（单个工具、整组）共用这一条路：都是 POST、都要在成功后重读、
+       * 失败都要落到同一处显示。**写完重读，而不是就地改本地状态** —— 界面上的一点
+       * 延迟换来的是「屏幕上显示的一定是真的」。
+       *
+       * @param {object} payload 除 sessionId 之外的请求体
+       * @returns {Promise<boolean>} 是否成功
        */
-      const toggle = async (tool, next) => {
-        if (busy || sessionId === null) return
+      const write = async (payload) => {
+        if (busy || sessionId === null) return false
         setBusy(true)
         try {
           const response = await fetch(ROUTE, {
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId, tool, disabled: next }),
+            body: JSON.stringify({ sessionId, ...payload }),
           })
           const body = await response.json().catch(() => ({}))
           if (!response.ok || body?.ok !== true) throw new Error(failureText(body, response.status))
           await load()
+          return true
         } catch (reason) {
           setError(String(reason?.message ?? reason))
+          return false
         } finally {
           setBusy(false)
         }
       }
+
+      /**
+       * 开关一个工具。
+       *
+       * @param {string} tool 工具名
+       * @param {boolean} next true = 关掉它
+       * @returns {Promise<boolean>} 是否成功
+       */
+      const toggle = (tool, next) => write({ tool, disabled: next })
+
+      /**
+       * 整组开关。一个组可能几百个工具，逐个点不现实。
+       *
+       * @param {object} group 组记录（宿主给的 {id, title, defaultEnabled, override, size}）
+       * @param {boolean} next true = 整组打开
+       * @returns {Promise<boolean>} 是否成功
+       */
+      const toggleGroup = (group, next) => write({ group: group.id, enabled: next })
 
       /**
        * 点「提醒」：让模型重新看一眼这个工具。
@@ -452,20 +511,19 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const needle = query.trim().toLowerCase()
-      const rows = data === null ? [] : data.tools.filter((tool) => needle === ''
-        || String(tool.name).toLowerCase().includes(needle)
-        || String(tool.description ?? '').toLowerCase().includes(needle))
-      const offCount = data === null ? 0 : data.tools.filter((tool) => tool.disabled === true).length
+      // 清单已经是宿主过滤、分页过的那一页 —— 面板不再自己过滤一遍（理由见函数顶部）。
+      const rows = data === null ? [] : data.tools
+      const offCount = rows.filter((tool) => tool.enabled !== true).length
 
       /**
        * 一行：开关 + 名字 + 描述。
        *
-       * @param {object} tool 工具记录（宿主给的 {name, description, disabled, banned, core}）
+       * @param {object} tool 工具记录（宿主给的
+       *   {name, description, enabled, banned, core, explicit, group, groupTitle}）
        * @returns {object} React 元素
        */
       const renderRow = (tool) => {
-        const off = tool.disabled === true
+        const off = tool.enabled !== true
         // 核心工具与部署级禁用的工具都不给点：前者关了就没有工具入口，后者是配置说了算。
         const locked = tool.core === true || tool.banned === true
         let hint = off ? '打开它' : '关掉它'
@@ -477,6 +535,17 @@ window.__ModuleLoader__.load({
         }
         if (tool.banned === true) {
           tags.push(React.createElement('span', { className: 'dsh-tool-gateway-panel-tag', key: 'banned' }, '部署禁用'))
+        }
+        // 组标签只在「全部工具」视图里给：选了某个组之后，每一行都写着同一个组名没有意义。
+        if (scope === '' && tool.groupTitle) {
+          tags.push(React.createElement('span', { className: 'dsh-tool-gateway-panel-tag', key: 'group' }, tool.groupTitle))
+        }
+        // 单独开过或关过的工具标出来 —— 它和「跟着组默认」不是一回事，
+        // 用户要能一眼看出自己动过哪几个。
+        if (tool.explicit === 'on') {
+          tags.push(React.createElement('span', { className: 'dsh-tool-gateway-panel-tag', key: 'explicit' }, '单独打开'))
+        } else if (tool.explicit === 'off') {
+          tags.push(React.createElement('span', { className: 'dsh-tool-gateway-panel-tag', key: 'explicit' }, '单独关掉'))
         }
         const knob = React.createElement('button', {
           type: 'button',
@@ -508,6 +577,13 @@ window.__ModuleLoader__.load({
 
       // 正文用显式的数组拼，不写嵌套三元：哪一段在什么条件下出现，一眼能读出来。
       const children = []
+      const total = data === null ? 0 : data.total
+      const limit = data === null ? PAGE_SIZE : data.limit
+      const hasPrev = offset > 0
+      const hasNext = data !== null && offset + limit < total
+      // 选中的那个组的完整记录 —— 整组开关要用它的 id 与条数。
+      const selected = data === null ? undefined : data.groups.find((group) => group.id === scope)
+
       children.push(React.createElement('div', { className: 'dsh-tool-gateway-panel-bar', key: 'bar' },
         React.createElement('input', {
           className: 'dsh-tool-gateway-panel-search',
@@ -518,7 +594,9 @@ window.__ModuleLoader__.load({
           onChange: (event) => setQuery(event.target.value),
         }),
         React.createElement('span', { className: 'dsh-tool-gateway-panel-count' },
-          data === null ? (sessionId === null ? '' : '读取中…') : '关掉 ' + offCount + ' / 共 ' + data.tools.length),
+          data === null ? (sessionId === null ? '' : '读取中…')
+            : (total === 0 ? '共 0 个' : (offset + 1) + '-' + (offset + rows.length) + ' / 共 ' + total
+              + ' · 本页关着 ' + offCount)),
         React.createElement('button', {
           type: 'button',
           className: 'dsh-tool-gateway-chip',
@@ -526,6 +604,42 @@ window.__ModuleLoader__.load({
           disabled: busy,
           onClick: () => { void load() },
         }, '刷新')))
+
+      // 组栏只在真的有组时出现 —— 没有注册任何组的部署（只有内置工具）不该多一排控件。
+      if (data !== null && data.groups.length > 0) {
+        const options = [React.createElement('option', { value: '', key: '' }, '全部工具')]
+        for (const group of data.groups) {
+          const on = group.override ?? group.defaultEnabled
+          options.push(React.createElement('option', { value: group.id, key: group.id },
+            group.title + '（' + group.size + ' 个 · ' + (on ? '开' : '关') + '）'))
+        }
+        children.push(React.createElement('div', { className: 'dsh-tool-gateway-panel-bar', key: 'groups' },
+          React.createElement('select', {
+            className: 'dsh-tool-gateway-panel-select',
+            'aria-label': '按工具组筛选',
+            value: scope,
+            onChange: (event) => { setScope(event.target.value); setOffset(0) },
+          }, options),
+          selected
+            ? React.createElement('button', {
+              type: 'button',
+              className: 'dsh-tool-gateway-chip',
+              disabled: busy,
+              title: '整组打开「' + selected.title + '」（' + selected.size + ' 个工具）',
+              onClick: () => { void toggleGroup(selected, true) },
+            }, '整组打开')
+            : null,
+          selected
+            ? React.createElement('button', {
+              type: 'button',
+              className: 'dsh-tool-gateway-chip',
+              disabled: busy,
+              title: '整组关掉「' + selected.title + '」（' + selected.size + ' 个工具）',
+              onClick: () => { void toggleGroup(selected, false) },
+            }, '整组关掉')
+            : null))
+      }
+
       if (error !== null) {
         children.push(React.createElement('div', {
           className: 'dsh-tool-gateway-panel-note', 'data-error': 'true', key: 'error',
@@ -539,11 +653,33 @@ window.__ModuleLoader__.load({
           '正在读取工具清单…'))
       } else if (rows.length === 0) {
         children.push(React.createElement('div', { className: 'dsh-tool-gateway-panel-note', key: 'empty' },
-          data.tools.length === 0 ? '这个部署里没有可显示的工具。' : '没有匹配的工具。'))
+          total === 0
+            ? (applied.trim() === '' && scope === '' ? '这个部署里没有可显示的工具。' : '没有匹配的工具。')
+            : '这一页是空的。'))
       } else {
         children.push(React.createElement('div', { className: 'dsh-tool-gateway-panel-list', key: 'list' },
           rows.map(renderRow)))
       }
+
+      // 分页栏只在真的不止一页时出现。
+      if (data !== null && (hasPrev || hasNext)) {
+        children.push(React.createElement('div', { className: 'dsh-tool-gateway-panel-bar', key: 'pages' },
+          React.createElement('button', {
+            type: 'button',
+            className: 'dsh-tool-gateway-chip',
+            disabled: busy || !hasPrev,
+            onClick: () => setOffset(Math.max(0, offset - limit)),
+          }, '上一页'),
+          React.createElement('span', { className: 'dsh-tool-gateway-panel-count' },
+            '第 ' + (Math.floor(offset / limit) + 1) + ' / ' + Math.max(1, Math.ceil(total / limit)) + ' 页'),
+          React.createElement('button', {
+            type: 'button',
+            className: 'dsh-tool-gateway-chip',
+            disabled: busy || !hasNext,
+            onClick: () => setOffset(offset + limit),
+          }, '下一页')))
+      }
+
       return React.createElement('div', { className: 'dsh-tool-gateway-panel' }, children)
     }
 

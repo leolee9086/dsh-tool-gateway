@@ -11,6 +11,7 @@
 import { randomUUID } from 'node:crypto'
 import { deliverContext } from './deliver-context.js'
 import { noticeSource } from './producer-source.js'
+import { fitSearchResults, resultTokenBudget } from './search-results.js'
 
 /** 两个元工具的名字。网关层用它做白名单，call_tool 用它拒绝自我递归。 */
 export const FIND_TOOLS = 'find_tools'
@@ -268,7 +269,9 @@ export function toolLines(entry, detail) {
   return [head]
 }
 
-export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults = DEFAULT_MAX_RESULTS, siblings = [] }) {
+export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults = DEFAULT_MAX_RESULTS, siblings = [],
+  budget = resultTokenBudget(), measure, authorizeDisabled, resolveDisabledCatalog,
+}) {
   /** 不能通过 call_tool 调用的名字：两个元工具自己，加上接线层告知的兄弟元工具。 */
   const blocked = new Set([FIND_TOOLS, CALL_TOOL, ...siblings])
 
@@ -305,11 +308,15 @@ export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults
       '省 token 的用法：先 find_tools({"detail":"name"}) 空手要一份名字清单，再挑真正要用的那几个',
       '按 names 取 params 或 full —— 不必把所有工具的完整 schema 都读一遍。',
       '',
+      '结果按 token 估算预算收缩：先折叠详情为名字，再截断尾部；用返回的 offset 继续同一查询。',
+      'scope 默认 enabled。disabled 仅查询本会话关闭项，每次需要审批，完全文件权限下不可用；查询不会开启工具。',
       '例：find_tools({"query":"搜索"})；find_tools({"names":["read","write"],"detail":"params"})。',
     ].join('\n'),
     parameters: {
       type: 'object',
       properties: {
+        scope: { type: 'string', enum: ['enabled', 'disabled'], description: '查询开启工具（默认）或逐次审批查询关闭工具；后者在完全权限下不可用。' },
+        offset: { type: 'integer', minimum: 0, description: '同一查询的继续位置，默认 0；沿用相同 query/names/detail/scope。' },
         query: {
           type: 'string',
           description: '模糊检索词：工具名、用途描述，或它的拼音。与 names 二选一',
@@ -333,80 +340,48 @@ export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults
       render: (_args, value) => [{ type: 'text', text: value.text }],
     },
     async execute(args, exec) {
-      const query = typeof args?.query === 'string' ? args.query.trim() : ''
-      const wanted = Array.isArray(args?.names)
-        ? args.names
-          .filter((entry) => typeof entry === 'string' && entry.trim() !== '')
-          .map((entry) => entry.trim())
-        : []
-      const detail = DETAIL_LEVELS.includes(args?.detail) ? args.detail : DEFAULT_DETAIL
-
-      if (query !== '' && wanted.length > 0) {
-        return { text: 'query 与 names 只能给一个：前者是检索，后者是按名字确定地取。' }
-      }
-
-      const schemas = schemaMap(exec?.agent)
-      const catalog = resolveCatalog(exec?.agent)
-
-      // 按确切名字取。不检索、不打分 —— 对不上就如实说没有，不去推荐"最像的"。
-      if (wanted.length > 0) {
-        const found = []
-        const missing = []
-        for (const name of wanted) {
-          if (!catalog.has(name)) {
-            missing.push(name)
-            continue
-          }
-          const schema = schemas.get(name)
-          found.push({ name, description: schema?.description ?? '', parameters: schema?.parameters })
-        }
-        const lines = found.flatMap((entry) => toolLines(entry, detail))
-        if (found.length > 0) {
-          lines.push('', '调用方式：call_tool({"tool_name":"<工具名>","arguments":{...}})。')
-        }
-        if (missing.length > 0) {
-          lines.push('', `没有这些工具：${missing.join('、')}。`
-            + '名字要精确（也可以拿 query 模糊找一个）；被本会话关掉的工具同样不在目录里。')
-        }
-        return { text: lines.join('\n') }
-      }
-
-      // 空手 + 只要名字 = 列一份清单。先看有哪些、再挑要看的，比一次全要省。
-      if (query === '') {
-        if (detail !== 'name') {
-          return {
-            text: '请给 query（模糊检索）或 names（按确切名字取）。'
-              + '只想看有哪些工具，就用 detail="name" 空手要一份名字清单。',
-          }
-        }
-        const all = catalog.names()
-        if (all.length === 0) return { text: '这个会话的目录里没有工具。' }
-        return { text: [`目录里有 ${all.length} 个工具：`, '', ...all.map((name) => `- ${name}`)].join('\n') }
-      }
-
-      const hits = catalog.search(query, maxResults)
-      if (hits.length === 0) {
-        return {
-          text: `没有匹配「${query}」的工具。换个说法再查（可以试工具名、用途，或拼音）；`
-            + '已经知道确切名字的话用 names 直接取，或者直接 call_tool 调它。',
-        }
-      }
-      const entries = hits.map((hit) => {
-        const schema = schemas.get(hit.name)
-        return {
-          name: hit.name,
-          description: hit.description || schema?.description || '',
-          parameters: schema?.parameters,
-        }
+      const scope = args?.scope ?? 'enabled'
+      const offset = args?.offset ?? 0
+      const reply = ({ entries = [], header = '', footer = '' }) => ({
+        text: fitSearchResults({ entries, header, footer, offset, budget, measure }).text,
       })
-      const lines = [
-        `匹配「${query}」的工具 ${entries.length} 个：`,
-        '',
-        ...entries.flatMap((entry) => toolLines(entry, detail)),
-        '',
-        '调用方式：call_tool({"tool_name":"<工具名>","arguments":{...}})。',
-      ]
-      return { text: lines.join('\n') }
+      if (!['enabled', 'disabled'].includes(scope)) throw new Error('scope 必须是 enabled 或 disabled')
+      // 在任何目录读取之前审批；批量程序调用也使用此执行入口。
+      if (scope === 'disabled') {
+        const denial = typeof authorizeDisabled === 'function'
+          ? await authorizeDisabled(exec) : '关闭工具查询未配置审批入口。'
+        if (denial !== undefined) return reply({ header: denial })
+      }
+      const query = typeof args?.query === 'string' ? args.query.trim() : ''
+      const wanted = [...new Set(Array.isArray(args?.names)
+        ? args.names.filter(name => typeof name === 'string' && name.trim() !== '').map(name => name.trim()) : [])]
+      const detail = DETAIL_LEVELS.includes(args?.detail) ? args.detail : DEFAULT_DETAIL
+      if (query !== '' && wanted.length > 0) return reply({ header: 'query 与 names 只能给一个：前者是检索，后者是按名字确定地取。' })
+      if (query === '' && wanted.length === 0 && detail !== 'name') {
+        return reply({ header: '请给 query（模糊检索）或 names（按确切名字取）。只想看有哪些工具，就用 detail="name" 空手要一份名字清单。' })
+      }
+      const catalog = scope === 'disabled' ? resolveDisabledCatalog(exec?.agent) : resolveCatalog(exec?.agent)
+      const schemas = schemaMap(exec?.agent)
+      const footer = scope === 'disabled'
+        ? '这些工具仍关闭；查看不会改变开关或业务授权。需要使用时请人在工具箱面板中开启。'
+        : '调用方式：call_tool({"tool_name":"<工具名>","arguments":{...}})。'
+      const render = name => {
+        const schema = schemas.get(name)
+        return { name, text: toolLines({ name, description: schema?.description ?? '', parameters: schema?.parameters }, detail).join('\n') }
+      }
+      if (wanted.length > 0) {
+        // 未找到项也作为完整条目参与预算和分页，不把无限长名单塞进尾注。
+        const entries = wanted.map(name => catalog.has(name) ? render(name)
+          : { name: name + '（当前范围未找到）', text: '- ' + name + '（当前范围未找到）' })
+        return reply({ entries, header: scope === 'disabled' ? '关闭工具查询：' : '开启工具查询：', footer })
+      }
+      if (query === '') {
+        const names = catalog.names()
+        return reply({ entries: names.map(name => ({ name, text: '- ' + name })), header: '目录里有 ' + names.length + ' 个工具：', footer: scope === 'disabled' ? footer : '' })
+      }
+      const hits = catalog.search(query, maxResults)
+      return reply({ entries: hits.map(hit => render(hit.name)),
+        header: hits.length === 0 ? '没有匹配的工具。换个说法再查，或用 names 查询确切名字。' : '匹配工具 ' + hits.length + ' 个：', footer })
     },
   }
 

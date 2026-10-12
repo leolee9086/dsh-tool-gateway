@@ -3,8 +3,9 @@
 把 DSH 的工具目录收成**三个元工具**：**`find_tools` 查、`call_tool` 调、`call_tools` 批量调**。
 其余工具不出现在模型可见的工具表里，但**仍然可以被调用** —— 只是入口变成了这几个。
 
-另外两件配套的事：**硬禁用名单**（某些工具在任何调用路径上都不许执行），以及**右侧栏的
-工具箱面板**（随时关掉某个工具 —— 关掉之后守卫拒绝、检索目录里也查不到它）。
+另外三件配套的事：**硬禁用名单**（某些工具在任何调用路径上都不许执行）、**右侧栏的
+工具箱面板**（随时开关某个工具或整组工具 —— 关掉之后守卫拒绝、检索目录里也查不到它），
+以及**工具组**（注册一批工具时声明「这批默认先关着」，用户再按需打开）。
 
 ## 它解决什么
 
@@ -47,6 +48,26 @@
 **唯一刻意不一样的地方**：官方 `run_code` 的 SDK 段落是遍历注册表生成的（把一百多个工具
 的名字和参数全喂给模型），我们这里是手写的两条声明 —— 那正是这个插件要消掉的东西。
 
+### 一次查多少：预算与分页
+
+`find_tools` 的结果按 **token 估算**收缩，顺序是：完整详情 → 折叠尾部条目的详情（只留名字）
+→ 截断尾部条目。预算默认 10000，可配（见下面的配置一节）。**单个 schema 不截断** ——
+半个 JSON 比没有更糟。
+
+被截断时返回的 `offset` 可以接着查同一份结果（沿用相同的 `query`/`names`/`detail`/`scope`）。
+
+### 查「关着的那些工具」
+
+`find_tools({scope: "disabled"})` 专门查这个会话里关掉的工具 —— 普通查询**不会**把它们
+列出来，否则模型会照着一次注定被拒的调用去准备参数。
+
+这条路径**每次都要审批**，而且在完全文件权限（`danger-full-access`）下直接拒绝：
+那条路径上没有人可以拦一下，而它是一条能让模型看到「现在被收起来的都是什么」的通道。
+审批服务报 `never` 时同样拒绝。
+
+**查询本身不改任何开关**，也不会解锁任何业务授权 —— 它只是"看一眼现在关着的是什么"。
+要真正用起来，得人在工具箱面板里打开它。
+
 ### 什么时候不挂 `call_tools`
 
 - **PTC 模式已经开着**（`mode: 'ptc'` 或 `'both'`）：那时 DSH 自己的 `run_code` 就在工具表里，
@@ -62,7 +83,7 @@
 ## 装
 
 ```sh
-dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
+dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.3.0
 ```
 
 `dsh plugin --profile <name> <args...>` 在 profile 目录里转发给 pnpm。装完它会依据本包
@@ -71,7 +92,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
 
 本包的 `lib/` 随仓库提交，所以从 git 安装**不需要 pnpm 的构建授权**（`allowBuilds`）：
 拉下来就是能直接加载的产物，包里没有 `prepare` 脚本，安装时不会在你机器上跑构建。
-想锁得更死，把 `#v0.2.1` 换成具体的 commit sha。
+想锁得更死，把 `#v0.3.0` 换成具体的 commit sha。
 
 重启 DSH 生效。**不需要改任何 preset** —— 它挂在 profile 层（根作用域）一次，
 对所有 preset、所有会话生效。
@@ -104,14 +125,24 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
 ## 工具箱面板
 
 右侧栏底部的「工具」按钮打开一个面板，里面是**这个会话**能看到的全部工具 —— 包括被网关
-收起来的那些。每个工具一行、一个开关。
+收起来的那些。每个工具一行、一个开关；有工具组时上面多一排组筛选与整组开关。
 
 - 关掉一个工具 → 它从 `find_tools` 的结果里消失；模型就算照着历史去调也会被守卫拒绝，
   拒绝理由里写清了「被关掉了、去哪儿打开」。同时会给这个会话注入一条通知，告诉模型刚刚
   变了什么（同一条通知机制，见上一节）。
 - **按会话记**：关掉一个工具是「这次别用它」的决定，换一个会话该不该用它是另一个决定。
-  状态就在工具箱模式那份记录的 `disabledTools` 字段里，同一张表、同一条 `ownerSessionId`
-  归属规则（子代理会话里关掉的工具记在父会话名下，通知发给正在看的那个会话）。
+  状态就在工具箱模式那份记录的 `disabledTools` / `enabledTools` 字段里，同一张表、
+  同一条 `ownerSessionId` 归属规则（子代理会话里关掉的工具记在父会话名下，
+  通知发给正在看的那个会话）。
+- **开关是三态的**：没设置（跟随它所属组的默认值）、显式开、显式关。所以「打开一个工具」
+  写的是显式开，而不是把关闭记录删掉 —— 那个工具可能属于一个默认关着的组，删掉记录
+  等于把它交还给组的默认值，而你要的是打开它。单独动过的工具在面板上标着
+  「单独打开 / 单独关掉」。
+- **有工具组时**，上面那排可以只看某一组，并对整组做「整组打开 / 整组关掉」。
+  组开关写的是**一个键**，不会往单工具名单里塞几百个名字。
+- **搜索与分页都在宿主侧做**（见 `src/route.js` 的 `filterTools`）。面板里过滤的话，
+  用户搜到的只是当前这一页里的匹配项，而计数是全量数字 —— 两个数字对不上，
+  用户会以为自己要的工具丢了。
 - **三个元工具不给关**（关了就没有工具入口了）；`config.ban.deny` 里的名字也不给点，
   那是配置说了算。
 - 会话 id 由页签 seat 直接交给正文，面板不需要问用户在哪个会话。
@@ -120,6 +151,45 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
 开关一个被收起来的工具，改的是**目录索引**（`find_tools` 检索到什么）与**守卫的判定**，
 两处都不在请求最前部那段工具定义里，所以整段前缀缓存不受影响。这也是面板**只用「拒绝」、
 不用 `restrict()`** 的原因 —— 后者会改模型可见工具表。
+
+## 工具组：让一批新工具默认关着
+
+有的插件一口气注册几百个工具（思源的 HTTP 端点就是这个量级）。全都默认开着的话，
+工具箱一打开就是几百行，而用户真正要用的往往只有几个。
+
+工具组让**注册方**说清楚「这一批是后加的、默认先关着」：
+
+```js
+const gateway = ctx.get('toolGateway')          // 拿不到 = 这个部署里没装网关
+if (gateway !== undefined) {
+  const group = gateway.registerGroup({
+    id: 'siyuan-http',
+    title: '思源 HTTP 端点',
+    origin: 'dsh-plugin-siyuan',
+    defaultEnabled: false,                       // 缺省就是关
+  })
+  ctx.effect(() => () => group.dispose(), 'siyuan: gateway group')
+  for (const tool of tools) {
+    ctx.tools.register(tool)
+    group.add(tool.name)                         // 注册一个就往组里放一个
+  }
+}
+```
+
+- **注册冲突直接抛错**：同一个 id 注册两次抛；一个工具名只能属于一个组，第二个组去认领
+  它同样抛。两条都是「让错误在发生的时刻爆出来」，而不是留一条「谁先注册谁赢」的隐规则。
+- 组的默认值是**关**（`defaultEnabled: false` 是缺省值）：注册一个组的典型理由就是
+  「先别放出来」，要默认开就得明写 `true`。
+- 组句柄上还有 `remove(name)`、`setDefaultEnabled(value)`、`dispose()`。
+  **撤销组之后，组内工具回到「不属于任何组」的判定 —— 也就是开着**：
+  插件卸载了，它当初要求的那份默认关闭也就没有主张的人了。
+- 用户那边的三态判定，优先级从高到低：单个工具显式关 → 单个工具显式开 → 整组的显式开关
+  → 组自己声明的默认值 → 不属于任何组（开）。
+- 网关自己不认识任何具体插件：它只提供 `registerGroup` / `listGroups` 两个方法，
+  组的语义全在 `src/groups.js` 里。
+
+**注册方必须在网关缺席时照常工作**：`ctx.get('toolGateway')` 返回 `undefined` 时
+就按普通工具注册，只是没有「默认关着」这回事。网关是可选依赖，不是硬依赖。
 
 ## 硬禁用名单
 
@@ -166,13 +236,14 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
 | `src/meta-tools.js` | `find_tools` / `call_tool`，以及三个元工具共用的 `invokeTool` |
 | `src/code-tools.js` | `call_tools`：把一段程序交给 PTC 运行时，只绑两个函数 |
 | `src/gateway.js` | 可见性过滤、执行守卫（**硬禁用先判**）、提示段落，都按 `keepFor(agent)` / `enabledFor(agent)` 分支 |
+| `src/groups.js` | 工具组名册，以及「这个工具此刻能不能用」的三态判定（纯函数，不认识 Cordis） |
 | `src/ban.js` | 硬禁用名单：静态名单的判定 + 按 agent 抹掉模型可见工具表（原 dsh-tool-ban） |
 | `src/deliver-context.js` | 子调用带回来的非文本内容（图片等）怎么送到模型眼前 |
 | `src/session-key.js` | 一个 agent 的开关记在哪个会话名下（子代理跟随父） |
-| `src/switch-state.js` | 开关状态与工具名单的读写与持久化（默认：约束开、一个都不禁） |
-| `src/route.js` | 给浏览器用的 HTTP 接口：会话开关（chip）+ 这个会话的工具清单与工具开关（面板） |
+| `src/switch-state.js` | 会话偏好的读写与持久化：总开关 + 三态工具名单 + 组覆盖（同一个会话的写入串行） |
+| `src/route.js` | 给浏览器用的 HTTP 接口：会话开关（chip）+ 工具清单的过滤分页、单工具 / 整组 / 批量开关（面板） |
 | `src/producer-source.js` | 本插件在 V4 会话里的消息源归属（写错会让整轮毫秒级静默失败） |
-| `src/switch-notice.js` | 开关变化时写给模型的那条通知（两种粒度：整个工具箱模式、单个工具） |
+| `src/switch-notice.js` | 开关变化时写给模型的那条通知（四种粒度：整个工具箱模式、单个工具、整组、批量） |
 | `src/client.js` | 浏览器半边：会话标题栏的 chip + 右侧栏的工具箱面板 |
 
 ## 检索
@@ -200,6 +271,8 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
       name: "dsh-tool-gateway"
       config:
         maxResults: 5      # find_tools 一次返回几条，默认 5
+        search:
+          resultTokenBudget: 10000   # find_tools 结果的 token 估算预算，默认 10000
         ban:
           deny: [ask_user_question]  # 硬禁用名单；显式写 [] 表示一个都不禁
           hide: true                 # 还要把被禁的工具从模型可见表里摘掉
@@ -242,6 +315,11 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
 - **程序结束就中止还在飞的子调用。** 程序写了 `tools.call_tool(...)` 却没 `await`，
   那个调用不会在结果返回之后继续跑下去 —— 它会随这次运行一起停掉，而且会等它
   收完尾才把结果交出去（不等的话，它的会话日志会落在这次调用之后）。
+- **PTC 模式下，关掉的工具仍然会出现在 `run_code` 的 SDK 段里。** 那段是宿主遍历
+  `tools.view(scope).visible` 生成的，而网关的可见性过滤只作用于 `system-prompt/assemble`，
+  管不到它。**但调用会被守卫拒绝** —— 硬禁用那一段排在 `parent` 判断之前，
+  PTC 派发的 inner call 一样绕不过去。之所以不去 `restrict()` 它们：那会改模型可见的
+  工具定义，整段前缀缓存就废了，而这个插件的一半价值就在那里。
 - 依赖三个包：`@node-rs/jieba`（原生模块）、`pinyin-pro`、`minisearch`。前两个都是
   预编译分发、无 install 脚本、零运行时依赖树。
 
@@ -249,7 +327,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.2.1
 
 ```sh
 pnpm install
-pnpm test          # 164 个测试
+pnpm test          # 223 个测试
 pnpm build         # 校验后逐字节拷贝 src/ → lib/
 ```
 

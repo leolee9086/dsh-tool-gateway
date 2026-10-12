@@ -77,48 +77,101 @@ test('写下的开关能读回来，并且真的落进了介质', async () => {
 
   await state.setEnabled('session-a', false)
   assert.equal(state.isEnabled('session-a'), false)
-  assert.deepEqual(records.get('session-a'), { enabled: false, disabledTools: [] })
+  assert.deepEqual(records.get('session-a'),
+    { enabled: false, disabledTools: [], enabledTools: [], groups: {} })
 
   await state.setEnabled('session-a', true)
   assert.equal(state.isEnabled('session-a'), true)
   // 总是写显式记录，不靠删除记录回到默认 —— 将来默认值若变化，这个会话不该跟着变。
-  assert.deepEqual(records.get('session-a'), { enabled: true, disabledTools: [] })
+  assert.deepEqual(records.get('session-a'),
+    { enabled: true, disabledTools: [], enabledTools: [], groups: {} })
 })
 
 test('工具开关：写下的关掉名单能读回来，并且与总开关互不干扰', async () => {
   const { facility, records } = stubStorage()
   const state = await createSwitchState(ctxWith(facility), () => {})
 
-  assert.deepEqual([...state.disabledTools('session-a')], [])
+  assert.deepEqual([...state.prefs('session-a').disabledTools], [])
 
   await state.setToolDisabled('session-a', 'web_search_meta', true)
-  assert.deepEqual([...state.disabledTools('session-a')], ['web_search_meta'])
-  assert.deepEqual(records.get('session-a'), { enabled: true, disabledTools: ['web_search_meta'] })
+  assert.deepEqual([...state.prefs('session-a').disabledTools], ['web_search_meta'])
+  assert.deepEqual(records.get('session-a'),
+    { enabled: true, disabledTools: ['web_search_meta'], enabledTools: [], groups: {} })
 
   // 关掉工具之后再切总开关：工具名单要原样留着。两个偏好同一条记录，
   // 所以写任意一个都必须把另一个带上 —— 这正是它换来的一致性。
   await state.setEnabled('session-a', false)
   assert.equal(state.isEnabled('session-a'), false)
-  assert.deepEqual([...state.disabledTools('session-a')], ['web_search_meta'])
+  assert.deepEqual([...state.prefs('session-a').disabledTools], ['web_search_meta'])
 
   await state.setToolDisabled('session-a', 'web_search_meta', false)
-  assert.deepEqual([...state.disabledTools('session-a')], [])
+  assert.deepEqual([...state.prefs('session-a').disabledTools], [])
   assert.equal(state.isEnabled('session-a'), false, '打开一个工具不该顺手动到总开关')
 })
 
-test('加 disabledTools 之前的旧记录仍然读得出来（向后兼容，不动 domain 版本）', async () => {
+test('工具开关是三态：关掉它是显式关，打开它是显式开，两边互斥', async () => {
+  const { facility } = stubStorage()
+  const state = await createSwitchState(ctxWith(facility), () => {})
+
+  await state.setToolDisabled('session-a', 'read', true)
+  assert.deepEqual([...state.prefs('session-a').disabledTools], ['read'])
+  assert.deepEqual([...state.prefs('session-a').enabledTools], [])
+
+  await state.setToolDisabled('session-a', 'read', false)
+  const prefs = state.prefs('session-a')
+  // 打开它不是「把关闭记录删掉」：那个工具可能属于一个默认关着的组，删掉记录等于
+  // 把它交还给组的默认值，而用户要的是「打开它」。
+  assert.deepEqual([...prefs.disabledTools], [])
+  assert.deepEqual([...prefs.enabledTools], ['read'])
+})
+
+test('组覆盖只写一个键，且不动逐个开关过的名单', async () => {
+  const { facility, records } = stubStorage()
+  const state = await createSwitchState(ctxWith(facility), () => {})
+
+  await state.setToolDisabled('session-a', 'siyuan_query', true)
+  await state.setGroupEnabled('session-a', 'siyuan-http', true)
+
+  const prefs = state.prefs('session-a')
+  assert.equal(prefs.groups.get('siyuan-http'), true)
+  assert.deepEqual([...prefs.disabledTools], ['siyuan_query'], '组开关不该动单工具的名单')
+  assert.deepEqual(records.get('session-a').groups, { 'siyuan-http': true })
+})
+
+test('批量开关和单个开关写的是同一份记录', async () => {
+  const { facility, records } = stubStorage()
+  const state = await createSwitchState(ctxWith(facility), () => {})
+
+  await state.setToolsDisabled('session-a', ['a', 'b', 'c'], true)
+  assert.deepEqual([...state.prefs('session-a').disabledTools], ['a', 'b', 'c'])
+
+  await state.setToolsDisabled('session-a', ['b'], false)
+  const prefs = state.prefs('session-a')
+  assert.deepEqual([...prefs.disabledTools], ['a', 'c'])
+  assert.deepEqual([...prefs.enabledTools], ['b'])
+  assert.equal(records.get('session-a').enabled, true, '批量开关不该动总开关')
+})
+
+test('加三态字段之前的旧记录仍然读得出来（向后兼容，不动 domain 版本）', async () => {
   const { facility } = stubStorage({ initial: { 'session-a': { enabled: false } } })
   const state = await createSwitchState(ctxWith(facility), () => {})
   assert.equal(state.isEnabled('session-a'), false)
-  assert.deepEqual([...state.disabledTools('session-a')], [])
+  const prefs = state.prefs('session-a')
+  assert.deepEqual([...prefs.disabledTools], [])
+  assert.deepEqual([...prefs.enabledTools], [])
+  assert.deepEqual([...prefs.groups], [])
 })
 
 test('domain 不可用时，工具开关同样降级到内存', async () => {
   const state = await createSwitchState(ctxWith(undefined), () => {})
   await state.setToolDisabled('session-a', 'read', true)
-  assert.equal(state.disabledTools('session-a').has('read'), true)
+  assert.equal(state.prefs('session-a').disabledTools.has('read'), true)
   await state.setToolDisabled('session-a', 'read', false)
-  assert.equal(state.disabledTools('session-a').has('read'), false)
+  const prefs = state.prefs('session-a')
+  assert.equal(prefs.disabledTools.has('read'), false)
+  assert.equal(prefs.enabledTools.has('read'), true)
+  await state.setGroupEnabled('session-a', 'g', false)
+  assert.equal(state.prefs('session-a').groups.get('g'), false)
 })
 
 test('重启后已存的覆盖仍然生效（open 时从介质读出来）', async () => {
@@ -150,7 +203,8 @@ test('schema 拒绝非对象、拒绝 enabled 不是布尔值', async () => {
 test('schema 规范化记录：多余的键不会跟着进内存', async () => {
   const { facility, records } = stubStorage({ initial: { 'session-a': { enabled: false, legacy: 'x' } } })
   await createSwitchState(ctxWith(facility), () => {})
-  assert.deepEqual(records.get('session-a'), { enabled: false, disabledTools: [] })
+  assert.deepEqual(records.get('session-a'),
+    { enabled: false, disabledTools: [], enabledTools: [], groups: {} })
 })
 
 test('storageDomain 不可用时降级到内存并告警一次', async () => {
@@ -175,6 +229,42 @@ test('domain 打不开时降级到内存并告警一次（不让插件加载失�
   assert.match(String(warnings[0].message), /backend-not-found/)
   await state.setEnabled('session-a', false)
   assert.equal(state.isEnabled('session-a'), false)
+})
+
+test('落盘有异步间隙时，并发写仍然不丢更新', async () => {
+  // 面板上连着点两下就是两次「读当前记录 → 改一个字段 → 写回」。如果两次读到同一份
+  // 旧记录，后写的那次会把先写的那次抹掉 —— 用户会看到自己刚打开的工具又关上了。
+  // 这里把落盘的间隙放大，验证同一个会话的读-改-写确实是串行的。
+  const records = new Map()
+  const facility = {
+    async open(spec) {
+      const [, tableSpec] = Object.entries(spec.tables)[0]
+      const schema = tableSpec.valueSchema
+      return {
+        table: () => ({
+          get: (key) => records.get(key),
+          put: async (key, value) => {
+            await new Promise((resolve) => setTimeout(resolve, 1))
+            records.set(key, schema.parse(value))
+          },
+        }),
+        async close() {},
+      }
+    },
+  }
+  const state = await createSwitchState(ctxWith(facility), () => {})
+
+  await Promise.all([
+    state.setToolDisabled('session-a', 'read', true),
+    state.setToolDisabled('session-a', 'write', true),
+    state.setGroupEnabled('session-a', 'siyuan', false),
+    state.setEnabled('session-a', false),
+  ])
+
+  const prefs = state.prefs('session-a')
+  assert.deepEqual([...prefs.disabledTools].sort(), ['read', 'write'])
+  assert.equal(prefs.groups.get('siyuan'), false)
+  assert.equal(prefs.enabled, false, '总开关那一次也不该被别的写覆盖')
 })
 
 test('close 转交给 domain', async () => {

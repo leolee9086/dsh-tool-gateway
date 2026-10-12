@@ -66,7 +66,7 @@ function setup({ outcome, maxResults, session } = {}) {
     },
   }
 
-  const [findTools, callTool] = createMetaTools({ ctx, resolveCatalog: () => catalog, maxResults })
+  const [findTools, callTool] = createMetaTools({ ctx, resolveCatalog: () => catalog, maxResults, measure: text => text.length })
   const exec = {
     callId: 'call-1',
     rootCallId: 'call-1',
@@ -119,7 +119,7 @@ test('find_tools：maxResults 生效', async () => {
   const catalog = createCatalog()
   catalog.rebuild(Array.from({ length: 8 }, (_, i) => ({ name: `search_${i}`, description: '搜索' })))
   const ctx = { tools: { schemas: () => [], get: () => undefined, execute: async () => ({}) } }
-  const [findTools] = createMetaTools({ ctx, resolveCatalog: () => catalog, maxResults: 3 })
+  const [findTools] = createMetaTools({ ctx, resolveCatalog: () => catalog, maxResults: 3, measure: text => text.length })
   const { text } = await findTools.execute({ query: '搜索' }, { callId: 'c', token: {}, signal: new AbortController().signal })
   // 每个工具占一行，顶格以 "- " 开头（参数清单与 JSON 都是缩进的）。
   assert.equal((text.match(/^- search_/gm) ?? []).length, 3)

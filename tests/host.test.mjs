@@ -318,6 +318,7 @@ test('卸载时把开关状态关掉', async () => {
 
 test('maxResults 配置会被 find_tools 用上（非法值回落到默认）', async () => {
   const ctx = stubCtx({ storage: stubStorageDomain() })
+  ctx.provide('tokenMeter', { estimateMessage: message => JSON.stringify(message).length })
   await apply(ctx, { maxResults: 0 })
   const findTools = ctx.registeredTools.find((tool) => tool.name === 'find_tools')
   // 空查询会直接返回提示，不碰 catalog —— 这里只证明配置没有把插件搞崩。
