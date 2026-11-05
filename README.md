@@ -39,7 +39,7 @@
 
 `call_tools` 干活的是一段**模型写的 TypeScript 程序**（DSH 的 PTC 运行时负责跑它）。
 程序里只有两个函数可调：`tools.find_tools({query})` 与 `tools.call_tool({tool_name, arguments})`。
-**只有程序 `return` 的值会回到对话里** —— 读十个文件、跑十次搜索，中间那些内容不必挤进上下文。
+**只有打印内容与程序结果会回到对话里** —— 异步函数体用 `return`，新版 REPL / script 用最后一个表达式。说明与参数会按运行时格式生成；支持持久变量的运行时按会话隔离，agent 或网关卸载时释放。
 
 它的参数、输出与界面呈现都对齐 DSH 官方 PTC 模式的 `run_code`：`description` 必填
 （那是卡片标题，也是审批弹窗里给人看的第一行字）、控制参数只在运行时真的支持时才出现、
@@ -75,15 +75,12 @@
   那个模式的执行守卫只放行 `run_code`）。
 - **部署里没挂 PTC 运行时**（`ctx.ptcRuntime` 缺席）：挂了也跑不了。
 
-检测用公开的 `tools.schemas(agent)` 看 `run_code` 在不在可见集里 —— 那正好是
-`modeFor(scope) !== 'native'` 的判据。检测**按会话算**（preset 可以用 `tools.presentAs()`
-单独选一个呈现模式），读不出来时保守地**不挂**：少一个能力不等于出错，
-而抢 PTC 的位置会真的出错。
+旧版通过 `tools.schemas(agent)` 判断呈现模式；新版的 `run_code` 属于 executor，按完整装配结果识别。新版官方 PTC 保留 `run_code`，SDK 在工具箱开启时只列 `find_tools` 与 `call_tool`，不再嵌套列出 `call_tools`。禁用规则仍在真实执行守卫上生效。
 
 ## 装
 
 ```sh
-dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.3.0
+dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.3.1
 ```
 
 `dsh plugin --profile <name> <args...>` 在 profile 目录里转发给 pnpm。装完它会依据本包
@@ -92,7 +89,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.3.0
 
 本包的 `lib/` 随仓库提交，所以从 git 安装**不需要 pnpm 的构建授权**（`allowBuilds`）：
 拉下来就是能直接加载的产物，包里没有 `prepare` 脚本，安装时不会在你机器上跑构建。
-想锁得更死，把 `#v0.3.0` 换成具体的 commit sha。
+想锁得更死，把 `#v0.3.1` 换成具体的 commit sha。
 
 重启 DSH 生效。**不需要改任何 preset** —— 它挂在 profile 层（根作用域）一次，
 对所有 preset、所有会话生效。
@@ -107,7 +104,7 @@ dsh plugin --profile web add github:leolee9086/dsh-tool-gateway#v0.3.0
 
 - 状态持久在 `$DSH_HOME/storages` 下的 `tool_gateway/sessions` 里，重启后仍然生效。
 - **子代理会话跟随父会话**：你只看得见父会话，而子代理的工具组合本来也是从父那里继承的。
-- 关掉之后：模型看到完整工具表、可以直接调用任何工具、系统提示里也不再出现那段使用说明。
+- 关掉之后：模型看到当前已启用工具表、可以直接调用其中的工具、系统提示里也不再出现那段使用说明。单工具、工具组和部署禁用仍生效。
   元工具仍然在（它们只是不再是唯一入口）。
 - **生效时机**：执行守卫**立刻**生效（下一次工具调用就放开或拦住）；
   工具表与提示段落**从下一轮请求开始**生效（装配发生在每一轮开始的时候）。
@@ -214,8 +211,7 @@ if (gateway !== undefined) {
 
 两层，缺一不可：
 
-1. **可见性** —— 在 `system-prompt/assemble` 瀑布里过滤 `assembled.tools`，
-   模型可见的工具表只剩那几个元工具（具体几个按会话算，见上）。这一步**不碰注册表**。
+1. **可见性** —— 旧版过滤装配瀑布；新版瀑布不再携带工具，因而包装完整 `SystemPrompt.assemble` 返回值，卸载时恢复原方法。过滤同时考虑网关、单工具和工具组开关，不修改注册表或宿主的逐步准入集合。
 2. **执行守卫** —— `ctx.tools.guard()` 拒绝模型对其它工具的直接调用。
    少了这一层，模型只要从历史里记得某个工具名、或者猜中一个，直接调用就会成功 ——
    注册表里那些工具一直都在。
@@ -224,8 +220,7 @@ if (gateway !== undefined) {
 `call_tool` 内部发起的调用带着 parent，模型直接发起的没有。这与 DSH 自己 PTC 模式的
 塌缩是同一种机制 —— 限制调用**路径**，不限制可见性。
 
-`call_tool` 走 `ctx.tools.execute()`，也就是注册表的公开执行入口：审批、守卫、
-沙箱策略、会话日志一步不少，与模型直接调用一个工具没有任何区别。
+旧版子调用走 `ctx.tools.execute()`；新版从 tools 服务所属 Loader 导入同一宿主的公开 `ToolExecutionPipeline`，执行 prepare、dispatch、complete，继承真实 parent、toolSet、signal 和目标 schema。审批、守卫、沙箱、条件准入、上下文及终止回合信号均保留。插件不安装第二份 Harness，不合并全局目录绕过作用域。
 
 ### 文件
 
@@ -285,12 +280,7 @@ if (gateway !== undefined) {
 - **不动会话历史。** 不改写、不压缩、不按历史分档、不扫会话事件判断状态。
   已经跑过一段的会话里那些直接调用 `read`、`bash` 的记录原样留着，
   说明里讲清楚了"入口变了"，模型会遵守。
-- **非文本内容（图片等）用 `agent.inject` 投递，不用 `deferContext`。** 后者把上下文并进
-  结果的 `additionalContexts`、由 agent loop 暂存进「下一步的 inbox」再以 `agent/inbox/spliced`
-  事件 splice 进会话；**实测它一次都没落地** —— 会话里从来没出现过那种事件，工具返回的图
-  只留在 `tool/ptc-dispatch` 的审计记录里（`surface=log-only`），模型永远看不到。
-  改用的 `agent.inject` 正是工具箱开关通知走的那条路，实测能到模型眼前。
-  两条通道的取舍写在 `src/deliver-context.js`。
+- **新版非文本和附加上下文走 `deferContext`。** 经执行结果逐层交回 AgentLoop，按结果顺序提交；旧版保留 `agent.inject` 兼容路径。子工具的 `concludeTurn` 同样逐层传递。
 - **注入的消息用生产者自己的来源 kind。** 往会话里追加消息时 `source.kind` 必须是
   `plugin:dsh-tool-gateway` —— V4 起消息源归生产者所有，退役的 `{ kind: 'plugin', plugin }`
   会被会话准入直接拒绝。症状很隐蔽：那一轮在**毫秒级**失败、错误码是 `UNKNOWN`、
@@ -303,8 +293,7 @@ if (gateway !== undefined) {
   所以它的 `source.kind` 必须归生产者所有 —— 见上一条。
 - **覆盖子代理。** 子代理加入父方的组装、走同一条装配瀑布，全局监听器与根作用域守卫
   都生效；开关也跟随父会话。父方通过 `toolFilter` 限制掉的工具，子代理既查不到也调不到。
-- **过滤出错时降级**：白名单一个都没匹配上就放行完整目录并告警一次 ——
-  工具多一点只是浪费，会话起不来是事故。
+- **新版装配异常明确报错**：元工具未能匹配时停止该次请求，不静默发送完整目录；旧版保留原有告警行为。
 - **不处理非文本块的内容**：`call_tool` 把图片等非文本块经 `deferContext` 作为独立
   上下文送出，不做转码或裁剪。`call_tools` 的子调用也一样（程序里调到的图片会附在那次结果之后）。
 - **`call_tools` 的程序里能调到的，就只有那两个函数。** 绑定只给
@@ -315,11 +304,7 @@ if (gateway !== undefined) {
 - **程序结束就中止还在飞的子调用。** 程序写了 `tools.call_tool(...)` 却没 `await`，
   那个调用不会在结果返回之后继续跑下去 —— 它会随这次运行一起停掉，而且会等它
   收完尾才把结果交出去（不等的话，它的会话日志会落在这次调用之后）。
-- **PTC 模式下，关掉的工具仍然会出现在 `run_code` 的 SDK 段里。** 那段是宿主遍历
-  `tools.view(scope).visible` 生成的，而网关的可见性过滤只作用于 `system-prompt/assemble`，
-  管不到它。**但调用会被守卫拒绝** —— 硬禁用那一段排在 `parent` 判断之前，
-  PTC 派发的 inner call 一样绕不过去。之所以不去 `restrict()` 它们：那会改模型可见的
-  工具定义，整段前缀缓存就废了，而这个插件的一半价值就在那里。
+- **新版官方 PTC 的 SDK 同样按开关过滤。** 用宿主自身 SDK renderer 重绘声明；执行守卫对任何 nested 调用继续强制禁用。程序知道旧工具名也不能绕过禁用。
 - 依赖三个包：`@node-rs/jieba`（原生模块）、`pinyin-pro`、`minisearch`。前两个都是
   预编译分发、无 install 脚本、零运行时依赖树。
 
@@ -327,7 +312,9 @@ if (gateway !== undefined) {
 
 ```sh
 pnpm install
-pnpm test          # 223 个测试
+pnpm test          # 现有纯逻辑及兼容回归
+# PowerShell：$env:DSH_TEST_CHECKOUT='D:\dev\deepseek-harness'
+pnpm test:integration  # 真实 Loader + AgentLoop + HTTP + Node PTC 子进程
 pnpm build         # 校验后逐字节拷贝 src/ → lib/
 ```
 

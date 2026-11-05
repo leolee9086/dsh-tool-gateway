@@ -135,14 +135,14 @@ function loggableArgs(args) {
  *   按名字取这个 agent 看得见的工具 schema，接线层注入（通常复用它的视图缓存）
  * @returns {Promise<{ text: string, context: object|undefined, isError: boolean }>} 结果
  */
-export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveSchema, signal = exec.signal }) {
+export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveSchema, executeNested = input => ctx.tools.execute(input), signal = exec.signal }) {
   const subCallId = `${String(exec.callId)}:${callIdSuffix}`
   const rootCallId = exec.rootCallId ?? exec.callId
   const logged = loggableArgs(args)
 
   // 审查者要的是"这一步要执行什么"：带上目标工具自己的 schema，且与 name 一致。
   // 注册表那份 schema 是共享的，冻一个浅拷贝，不动它。
-  const resolved = resolveSchema === undefined ? undefined : resolveSchema(exec?.agent, name)
+  const resolved = resolveSchema === undefined ? undefined : resolveSchema(exec?.agent, name, exec?.toolSet)
   const schema = resolved === undefined ? undefined : Object.freeze({ ...resolved })
 
   /**
@@ -170,13 +170,14 @@ export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveS
   //
   // parent 必须带上：它把这个调用标记成"子分发"而不是"模型直接调用"，
   // 网关的守卫据此放行；rootCallId 指回最外层那次调用，日志里能看出调用树的根。
-  const result = await ctx.tools.execute({
+  const result = await executeNested({
     callId: subCallId,
-    rootCallId: exec.rootCallId,
+    rootCallId,
     name,
     ...(schema === undefined ? {} : { schema }),
     arguments: args,
     ...(exec?.agent === undefined ? {} : { agent: exec.agent }),
+    ...(exec?.toolSet === undefined ? {} : { toolSet: exec.toolSet }),
     parent: exec.token,
     signal,
   })
@@ -189,8 +190,14 @@ export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveS
     arguments: logged,
     isError: result?.isError === true,
     content: Array.isArray(result?.content) ? result.content : [],
+    ...(result?.error?.info === undefined ? {} : { error: result.error.info }),
+    ...(result?.meta === undefined ? {} : { meta: result.meta }),
   })
 
+  // 子工具产生的上下文与终止回合信号必须沿父调用返回 AgentLoop。
+  // 只拼 content 会丢失 deferContext（包括图片之外的上下文）和 concludeTurn。
+  for (const context of result.additionalContexts ?? []) deliverContext(exec, context)
+  if (!result.isError && result.concludesTurn === true) exec.concludeTurn()
   const { text, context } = splitOutcome(result)
   return { text, context, isError: result?.isError === true }
 }
@@ -269,7 +276,7 @@ export function toolLines(entry, detail) {
   return [head]
 }
 
-export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults = DEFAULT_MAX_RESULTS, siblings = [],
+export function createMetaTools({ ctx, executeNested, resolveCatalog, resolveSchema, maxResults = DEFAULT_MAX_RESULTS, siblings = [],
   budget = resultTokenBudget(), measure, authorizeDisabled, resolveDisabledCatalog,
 }) {
   /** 不能通过 call_tool 调用的名字：两个元工具自己，加上接线层告知的兄弟元工具。 */
@@ -281,9 +288,9 @@ export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults
    * 必须传 agent：不传 scope 只看到全局层，preset 注册的工具会全部漏掉
    * （社区插件在这里踩过，见 dev-tool-search 的注释）。
    */
-  const schemaMap = (agent) => {
+  const schemaMap = (agent, toolSet) => {
     const map = new Map()
-    for (const schema of ctx.tools.schemas(agent)) map.set(schema.name, schema)
+    for (const schema of ctx.tools.schemas(agent, toolSet)) map.set(schema.name, schema)
     return map
   }
 
@@ -360,8 +367,8 @@ export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults
       if (query === '' && wanted.length === 0 && detail !== 'name') {
         return reply({ header: '请给 query（模糊检索）或 names（按确切名字取）。只想看有哪些工具，就用 detail="name" 空手要一份名字清单。' })
       }
-      const catalog = scope === 'disabled' ? resolveDisabledCatalog(exec?.agent) : resolveCatalog(exec?.agent)
-      const schemas = schemaMap(exec?.agent)
+      const catalog = scope === 'disabled' ? resolveDisabledCatalog(exec?.agent, exec?.toolSet) : resolveCatalog(exec?.agent, exec?.toolSet)
+      const schemas = schemaMap(exec?.agent, exec?.toolSet)
       const footer = scope === 'disabled'
         ? '这些工具仍关闭；查看不会改变开关或业务授权。需要使用时请人在工具箱面板中开启。'
         : '调用方式：call_tool({"tool_name":"<工具名>","arguments":{...}})。'
@@ -411,21 +418,21 @@ export function createMetaTools({ ctx, resolveCatalog, resolveSchema, maxResults
     async execute(args, exec) {
       const name = typeof args?.tool_name === 'string' ? args.tool_name.trim() : ''
       if (name.length === 0) {
-        return { text: '请提供 tool_name。不知道名字就先用 find_tools 查。' }
+        throw new Error('请提供 tool_name。不知道名字就先用 find_tools 查。')
       }
       if (blocked.has(name)) {
-        return { text: `${name} 不能通过 call_tool 调用（会递归）。直接用它的参数调用它自己即可。` }
+        throw new Error(`${name} 不能通过 call_tool 调用（会递归）。直接用它的参数调用它自己即可。`)
       }
-      if (ctx.tools.get(name, exec?.agent) === undefined) {
-        return {
-          text: `没有名为「${name}」的工具。用 find_tools 查一下确切名字 —— `
-            + '注意工具名区分下划线与大小写。',
-        }
+      if (ctx.tools.get(name, exec?.agent, exec?.toolSet) === undefined) {
+        throw new Error(`没有名为「${name}」的当前可用工具。用 find_tools 查一下确切名字 —— `
+          + '注意工具名区分下划线与大小写。')
       }
-      const { text, context } = await invokeTool({
-        ctx, name, args: args?.arguments ?? {}, exec, callIdSuffix: 'meta', resolveSchema,
+      const { text, context, isError } = await invokeTool({
+        ctx, name, args: args?.arguments ?? {}, exec, callIdSuffix: 'meta', resolveSchema, executeNested,
       })
       deliverContext(exec, context)
+      // call_tools 的绑定依赖外层 isError 抛 ToolCallError，不能把子失败包装成成功。
+      if (isError) throw new Error(text)
       return { text }
     },
   }

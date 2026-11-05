@@ -3,8 +3,8 @@
  *
  * **两层，缺一不可：**
  *
- * 1. **可见性** —— `system-prompt/assemble` 瀑布里过滤 `assembled.tools`。
- *    模型看到的工具清单就是这个瀑布的产物，过滤它一个字节都不碰注册表。
+ * 1. **可见性** —— 旧版过滤 assemble 瀑布；新版过滤完整 assemble 返回值。
+ *    同时应用会话可用性，保留原始注册表、作用域与条件准入。
  * 2. **执行** —— `ctx.tools.guard` 单调守卫，拒绝模型对非元工具的直接调用。
  *
  * 为什么两层都要：注册表**没有**被改动，而 `resolveExecution` 走的是 `visible` ——
@@ -33,6 +33,7 @@
  * 的子分发也拦得住；网关规则对子分发放行。这两段曾经分属两个插件，合并的理由见 ban.js。
  */
 import { CALL_TOOLS } from './code-tools.js'
+import { importHostToolsModule } from './execution-adapter.js'
 
 /** 提示段落的位置：排在 persona(0) 与各工具说明(1000+) 之间，让模型先读到规则。 */
 const NOTICE_ORDER = 700
@@ -102,21 +103,26 @@ export function noticeText(keep) {
  * @param {(error: unknown) => void} warnOnce 降级时的告警回调
  * @returns {void}
  */
-export function installAssembleFilter(ctx, keepFor, enabledFor, warnOnce) {
+export function installAssembleFilter(ctx, keepFor, enabledFor, warnOnce, usableFor = () => true) {
+  // 0.2.2 的瀑布只返回文本；必须等真实 assemble 完成后过滤最终声明。
+  // 注册表、作用域和原始 step admission 均不变，子调用仍走宿主的执行检查。
+  if (typeof ctx.tools.resolve === 'function') {
+    installAssemblyResultFilter(ctx, keepFor, enabledFor, usableFor)
+    return
+  }
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     // 瀑布语义：必须先 await next() 拿到下游产物，再改它。
     // 不调 next() 会截断整条链，别处的提示词贡献就全丢了。
     const assembled = await next()
     try {
-      // 这个会话把网关关了：原样返回，一个字节都不动。
-      if (!enabledFor(context?.agent)) return assembled
-
-      const keep = keepFor(context?.agent)
+      const agent = context?.agent
+      const enabled = enabledFor(agent)
+      const keep = keepFor(agent)
       const tools = Array.isArray(assembled?.tools) ? assembled.tools : []
-      const kept = tools.filter((tool) => keep.has(tool?.name))
+      const kept = tools.filter((tool) => usableFor(agent, tool.name) && (!enabled || keep.has(tool.name)))
       // 一个都没留下说明元工具还没注册上（挂载时序），这时暴露完整目录：
       // 工具多一点只是浪费，会话起不来是事故。
-      if (kept.length === 0) {
+      if (enabled && kept.length === 0) {
         warnOnce(new Error(`没有匹配到任何白名单工具（期望 ${[...keep].join(', ')}），本轮暴露完整目录`))
         return assembled
       }
@@ -127,6 +133,66 @@ export function installAssembleFilter(ctx, keepFor, enabledFor, warnOnce) {
       return assembled
     }
   })
+}
+
+/**
+ * 在新宿主的完整装配结果上过滤声明，随插件卸载恢复原方法。
+ * 不绑定调用方 this：Cordis 会按使用位置注入正确的作用域上下文。
+ */
+function installAssemblyResultFilter(ctx, keepFor, enabledFor, usableFor) {
+  const service = ctx.systemPrompt
+  let sdkModule
+  ctx.effect(() => {
+    const own = Object.getOwnPropertyDescriptor(service, 'assemble')
+    let owner = service
+    let descriptor = own
+    while (descriptor === undefined && (owner = Object.getPrototypeOf(owner)) !== null) {
+      descriptor = Object.getOwnPropertyDescriptor(owner, 'assemble')
+    }
+    if (typeof descriptor?.value !== 'function') throw new Error('systemPrompt.assemble 不是可包装的方法')
+    const assemble = descriptor.value
+    let active = true
+    async function filteredAssembly(...args) {
+      const assembly = await Reflect.apply(assemble, this, args)
+      if (!active) return assembly
+      const context = args[0] ?? {}
+      // scope 也可能是 preset 诊断键，只有带 Session 的 scope 才是 agent。
+      const agent = context.agent ?? (context.scope?.session === undefined ? undefined : context.scope)
+      const enabled = enabledFor(agent)
+      const keep = keepFor(agent)
+      // 新 PTC 的 run_code 属于 executor，不在 capability schemas() 中。
+      // 保留传输工具，按相同偏好重绘官方 SDK；执行仍由真实守卫和 admission 强制。
+      if (assembly.tools.some(tool => tool.name === 'run_code')) {
+        const runtime = ctx.get('ptcRuntime')
+        const sdk = await (sdkModule ??= importHostToolsModule(ctx, '@deepseek-ai/dsh-tool-executor-ptc'))
+        const schemas = ctx.tools.schemas(agent, context.toolSet)
+          .filter(tool => tool.name !== CALL_TOOLS && usableFor(agent, tool.name) && (!enabled || keep.has(tool.name)))
+          .map(tool => ({ ...tool, output: ctx.tools.get(tool.name, agent, context.toolSet).output.schema }))
+        const render = runtime.language === 'typescript' ? sdk.renderToolsSdk
+          : runtime.language === 'python' ? sdk.renderToolsSdkPy : undefined
+        if (render === undefined) throw new Error(`工具网关不支持 PTC 语言 ${runtime.language}`)
+        return { ...assembly, sections: assembly.sections.map(section => {
+          if (section.name === 'tools:sdk') return { ...section, text: render(schemas, runtime.programFormat) }
+          if (enabled && section.name === 'tool-gateway') return { ...section, text:
+            '工具箱已开启。通过 run_code 中的 tools.find_tools 查询，再用 tools.call_tool 调用已启用工具。SDK 只列这两个入口；禁用工具不可调用。' }
+          return section
+        }) }
+      }
+      const tools = assembly.tools.filter(tool => usableFor(agent, tool.name) && (!enabled || keep.has(tool.name)))
+      if (enabled && tools.length === 0 && assembly.tools.length > 0) {
+        throw new Error('工具网关未找到可用元工具；停止请求，避免发送未收窄的工具目录。')
+      }
+      return { ...assembly, tools }
+    }
+    Object.defineProperty(service, 'assemble', { configurable: true, writable: true, value: filteredAssembly })
+    return () => {
+      active = false
+      // 后来的包装者仍可调用此函数；此时透传，不能覆盖别人的方法。
+      if (Object.getOwnPropertyDescriptor(service, 'assemble')?.value !== filteredAssembly) return
+      if (own === undefined) Reflect.deleteProperty(service, 'assemble')
+      else Object.defineProperty(service, 'assemble', own)
+    }
+  }, 'dsh-tool-gateway: 完整装配结果过滤')
 }
 
 /**
@@ -155,6 +221,8 @@ export function installGuard(ctx, keepFor, enabledFor, banFor) {
       // 两个理由：它不是模型直接调用；它也是这条路上最频繁的一类，而它既不需要读开关、
       // 也不需要算元工具清单。
       if (execution?.parent !== undefined) return undefined
+      // 新版 PTC 的 executor-owned 入口不属于注册表能力，必须允许它进入 SDK。
+      if (execution?.name === 'run_code') return undefined
       // 这个会话把网关关了：不拦，模型可以直接调。
       if (!enabledFor(execution?.agent)) return undefined
 

@@ -1,0 +1,31 @@
+# 各入口指向测试以源码方式导入的生产模块，只有模型响应是脚本输入。
+- id: llm
+  name: cordis:llm
+- id: sessions
+  name: cordis:sessions
+- id: projections
+  name: cordis:projections
+- id: prompt
+  name: cordis:prompt
+  config: { personaPrefix: '', personaSuffix: '' }
+- id: tools
+  name: cordis:tools
+- id: native
+  name: cordis:native
+- id: agents
+  name: cordis:agents
+- id: loop
+  name: cordis:loop
+  config: { agents: [] }
+- id: meter
+  name: cordis:meter
+- id: credentials
+  name: cordis:credentials
+  config: { watch: false }
+- id: web
+  name: cordis:web
+  config: { host: 127.0.0.1, port: 0 }
+- id: connection
+  name: cordis:connection
+- id: gateway
+  name: cordis:gateway
