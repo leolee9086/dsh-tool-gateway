@@ -436,16 +436,17 @@ export async function apply(ctx, config = {}) {
     listGroups: describeGroups,
   }))
 
+  const runLogWork = new Map()
   for (const definition of createMetaTools({
     ctx, executeNested, resolveCatalog, resolveSchema, maxResults, siblings: [CALL_TOOLS],
     budget, measure, resolveDisabledCatalog, authorizeDisabled: exec => authorizeDisabledQuery(ctx, exec),
-    scopeTarget,
+    scopeTarget, runLogWork,
   })) {
     ctx.effect(() => ctx.tools.register(definition), `${name}: ${definition.name}`)
   }
   // 第三个元工具无条件注册：apply 时没有 agent 上下文，而“该不该让它露面”
   // 是按 agent 判的（见 keepFor）。它只是躺在注册表里，模型看不到也调不到。
-  for (const definition of createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget })) {
+  for (const definition of createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget, runLogWork })) {
     ctx.effect(() => ctx.tools.register(definition), `${name}: ${definition.name}`)
   }
 
@@ -476,13 +477,15 @@ export async function apply(ctx, config = {}) {
     const webServer = webCtx.get('webServer')
     const connection = webCtx.get('connection')
     if (webServer === undefined || typeof webServer.register !== 'function'
-      || connection === undefined || typeof connection.requestRejection !== 'function') {
+      || connection === undefined
+      || (typeof connection.requestRejection !== 'function' && typeof connection.admit !== 'function')) {
       warnOnce(new Error('webServer 或 connection 形状不对，会话开关没有界面（网关本身照常工作）'))
       return
     }
-    const handler = createGatewayRoute(ctx, state, {
+    const handler = createGatewayRoute(webCtx, state, {
       listTools, invalidate, coreNames: META_TOOL_NAMES, listGroups: describeGroups,
     })
-    ctx.effect(() => webServer.register({ kind: 'exact', path: ROUTE, handler }), `${name}: 会话开关与工具箱面板路由`)
+    ctx.effect(() => webServer.register({ kind: 'exact', path: ROUTE,
+      ...(typeof connection.requestRejection === 'function' ? {} : { auth: 'required' }), handler }), `${name}: 会话开关与工具箱面板路由`)
   })
 }

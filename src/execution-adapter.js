@@ -28,11 +28,12 @@ export async function importHostToolsModule(ctx, specifier) {
 export async function importScopeTarget(ctx) {
   try {
     const scope = await importHostToolsModule(ctx, '@deepseek-ai/dsh-scope')
-    if (typeof scope?.scopeTarget !== 'function') return undefined
+    if (typeof scope?.scopeTarget !== 'function') throw new Error('宿主 scope 模块缺少 scopeTarget')
     return scope.scopeTarget
   } catch (error) {
-    // 旧宿主与测试桩没有跨模块加载树：日志副本退回原文，这是设计内的降级，
-    // 不是需要人处理的错误。这里不告警，免得每次装配都刷一条没有动作可做的日志。
+    // 仅没有 Loader 身份的旧接口允许降级；真实宿主的解析错误必须使装配失败。
+    const original = ctx.tools[Symbol.for('cordis.original')] ?? ctx.tools
+    if (original.ctx?.fiber?.entry?.parent?.tree !== undefined) throw error
     return undefined
   }
 }

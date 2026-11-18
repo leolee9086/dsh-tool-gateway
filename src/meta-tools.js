@@ -14,14 +14,9 @@ import { noticeSource } from './producer-source.js'
 import { fitSearchResults, resultTokenBudget } from './search-results.js'
 
 /**
- * 一次 `call_tools` 运行里登记着、还没写进会话的日志任务，按根调用 id 索引。
- *
- * 官方 PTC 把它们放在 run 自己的 `logWork` 集合里，程序一结束统一 drain：日志落盘
- * （尤其 spill 写文件）不能拖住程序拿值，也不能让事件落到回合之后。网关的
- * `call_tools` 在另一个模块里，跨不进这里的闭包，所以用进程内的 Map 登记；
- * 键是根调用 id，运行结束就删，不跨会话共享。
+ * 日志账本由 host 插件实例创建并传给两个工具工厂，不保存在模块全局。
+ * 子调用先返回值，所属运行收尾时等待账本中的日志任务。
  */
-const runLogWork = new Map()
 
 /**
  * 把一条日志任务登记到它所属的运行里。
@@ -30,7 +25,8 @@ const runLogWork = new Map()
  * @param {Promise<void>} task 日志任务（自己吞错，不会 reject）
  * @returns {boolean} true = 已登记；false = 没有对应运行，调用方自己等它
  */
-export function deferLogToRun(rootCallId, task) {
+export function deferLogToRun(rootCallId, task, runLogWork) {
+  if (runLogWork === undefined) return false
   if (typeof rootCallId !== 'string') return false
   const work = runLogWork.get(rootCallId)
   if (work === undefined) return false
@@ -45,7 +41,8 @@ export function deferLogToRun(rootCallId, task) {
  * @param {string} rootCallId 根调用 id
  * @returns {Set<Promise<void>>} 该运行的待写任务集合
  */
-export function openRunLogWork(rootCallId) {
+export function openRunLogWork(rootCallId, runLogWork) {
+  if (runLogWork.has(rootCallId)) throw new Error('重复的运行日志账本')
   const work = new Set()
   runLogWork.set(rootCallId, work)
   return work
@@ -57,7 +54,7 @@ export function openRunLogWork(rootCallId) {
  * @param {string} rootCallId 根调用 id
  * @returns {Promise<void>} 全部任务落定之后 resolve
  */
-export async function closeRunLogWork(rootCallId) {
+export async function closeRunLogWork(rootCallId, runLogWork) {
   const work = runLogWork.get(rootCallId)
   if (work === undefined) return
   runLogWork.delete(rootCallId)
@@ -187,11 +184,11 @@ function loggableArgs(args) {
  * @param {(base: object, key: object|undefined) => object} [options.scopeTarget]
  *   宿主的 scopeTarget。有它才能把日志副本交给 `tools/ptc-dispatch-log` 瀑布；
  *   缺省时退回原文日志（旧宿主没有这条通道）
- * @param {boolean} [options.log] 是否记这一跳的日志。`call_tools` 的外层
- *   `call_tool` 绑定传 false —— 内层会记真正被调的那个工具，两层都记会重复
+ * @param {boolean|'summary'} [options.log] 日志模式。转发节点传 summary：
+ *   成功仅记状态摘要，失败仍记错误；保留调用树关系而不复制成功正文。
  * @returns {Promise<{ text: string, context: object|undefined, isError: boolean }>} 结果
  */
-export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveSchema, executeNested = input => ctx.tools.execute(input), signal = exec.signal, scopeTarget, log = true }) {
+export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveSchema, executeNested = input => ctx.tools.execute(input), signal = exec.signal, scopeTarget, runLogWork, log = true }) {
   const subCallId = `${String(exec.callId)}:${callIdSuffix}`
   const rootCallId = exec.rootCallId ?? exec.callId
   const logged = loggableArgs(args)
@@ -264,7 +261,11 @@ export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveS
   })
 
   if (canLog) {
-    const content = Array.isArray(result?.content) ? result.content : []
+    // 转发节点成功时只保存状态，保留调用树且不重复保存子工具正文。
+    // 失败可能发生在内层调用之前，必须保留错误并照常经过日志策略。
+    const content = log === 'summary' && result?.isError !== true
+      ? [{ type: 'text', text: '工具转发成功；完整结果见子调用。' }]
+      : Array.isArray(result?.content) ? result.content : []
     // 日志任务自己吞错（shapeLog 与 append 都有兜底），不会 reject。
     const task = (async () => {
       const shaped = await shapeLog({
@@ -284,7 +285,7 @@ export async function invokeTool({ ctx, name, args, exec, callIdSuffix, resolveS
     })()
     // 官方语义：程序先拿值，日志落盘不能拖住它。没有运行账本的调用（模型直接
     // 调 call_tool）就等这一条写完再返回 —— 那时没有批量程序会被拖慢。
-    if (!deferLogToRun(rootCallId, task)) await task
+    if (!deferLogToRun(JSON.stringify([exec.agent?.session?.id ?? exec.agent?.session?.header?.id ?? null, rootCallId]), task, runLogWork)) await task
   }
 
   // 子工具产生的上下文与终止回合信号必须沿父调用返回 AgentLoop。
@@ -372,7 +373,7 @@ export function toolLines(entry, detail) {
 }
 
 export function createMetaTools({ ctx, executeNested, resolveCatalog, resolveSchema, maxResults = DEFAULT_MAX_RESULTS, siblings = [],
-  budget = resultTokenBudget(), measure, authorizeDisabled, resolveDisabledCatalog, scopeTarget,
+  budget = resultTokenBudget(), measure, authorizeDisabled, resolveDisabledCatalog, scopeTarget, runLogWork,
 }) {
   /** 不能通过 call_tool 调用的名字：两个元工具自己，加上接线层告知的兄弟元工具。 */
   const blocked = new Set([FIND_TOOLS, CALL_TOOL, ...siblings])
@@ -523,7 +524,7 @@ export function createMetaTools({ ctx, executeNested, resolveCatalog, resolveSch
           + '注意工具名区分下划线与大小写。')
       }
       const { text, context, isError } = await invokeTool({
-        ctx, name, args: args?.arguments ?? {}, exec, callIdSuffix: 'meta', resolveSchema, executeNested, scopeTarget,
+        ctx, name, args: args?.arguments ?? {}, exec, callIdSuffix: 'meta', resolveSchema, executeNested, scopeTarget, runLogWork,
       })
       deliverContext(exec, context)
       // call_tools 的绑定依赖外层 isError 抛 ToolCallError，不能把子失败包装成成功。

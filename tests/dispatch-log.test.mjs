@@ -92,8 +92,9 @@ test('有运行账本时日志异步登记：drain 之后才写进会话，期�
   const ctx = stubCtx(async (dispatch, next) => { await gate; return next() })
   const exec = makeExec(appended)
 
-  const work = openRunLogWork('call-1')
-  const outcome = await invokeTool({ ...base, ctx, name: 't', args: {}, exec })
+  const runLogWork = new Map()
+  const work = openRunLogWork(JSON.stringify(['session-x', 'call-1']), runLogWork)
+  const outcome = await invokeTool({ ...base, ctx, name: 't', args: {}, exec, runLogWork })
 
   // 程序已经拿到值，而日志副本还卡在瀑布里 —— 落盘不拖住绑定。
   assert.equal(outcome.text.length, 5000)
@@ -101,7 +102,7 @@ test('有运行账本时日志异步登记：drain 之后才写进会话，期�
   assert.equal(appended.filter((entry) => entry.event === 'tool/ptc-dispatch').length, 0)
 
   release()
-  await closeRunLogWork('call-1')
+  await closeRunLogWork(JSON.stringify(['session-x', 'call-1']), runLogWork)
   assert.equal(appended.filter((entry) => entry.event === 'tool/ptc-dispatch').length, 1)
 })
 

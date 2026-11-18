@@ -237,7 +237,7 @@ export function createGatewayRoute(ctx, state, helpers = {}) {
   const coreNames = helpers.coreNames instanceof Set ? helpers.coreNames : new Set()
   const listGroups = typeof helpers.listGroups === 'function' ? helpers.listGroups : () => []
 
-  return async function handle(req, res) {
+  return async function handle(req, res, peer) {
     // 整个 handler 都在 try 里，包括鉴权那一步 —— `connection.requestRejection` 自己
     // 也可能抛，而 handler 返回的 promise 没有别人接。最外层这一层保证任何一条路径
     // 都给出一个响应，不会有静默失败。
@@ -247,7 +247,9 @@ export function createGatewayRoute(ctx, state, helpers = {}) {
         json(res, 503, { ok: false, reason: 'service-unavailable', error: '连接鉴权服务不可用' })
         return
       }
-      const rejected = connection.requestRejection(req)
+      const rejected = typeof connection.requestRejection === 'function'
+        ? connection.requestRejection(req)
+        : peer === undefined ? 401 : undefined
       if (rejected !== undefined) {
         json(res, rejected, { ok: false, reason: rejected === 401 ? 'unauthorized' : 'forbidden' })
         return

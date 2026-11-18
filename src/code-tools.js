@@ -247,7 +247,7 @@ async function approveEscalation(request, approval) {
  *   按名字取工具 schema，转交给 invokeTool —— 派发出去的那一跳要带上它（见 meta-tools.js）
  * @returns {object[]} 一个工具定义
  */
-export function createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget }) {
+export function createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget, runLogWork = new Map() }) {
   /** 读运行时，读不到就返回 undefined。schema 投影时只能这么读 —— 不能抛。 */
   const peekRuntime = () => ctx.get('ptcRuntime')
 
@@ -446,7 +446,8 @@ export function createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget
       // 本次运行的日志账本：子调用的 dispatch 日志会被登记在这里，程序结束统一
       // drain。它们不阻塞 bindings 的 promise —— 程序拿值不该等 spill 写盘。
       const rootCallId = exec.rootCallId ?? exec.callId
-      openRunLogWork(rootCallId)
+      const runLogKey = JSON.stringify([exec.agent?.session?.id ?? exec.agent?.session?.header?.id ?? null, rootCallId])
+      openRunLogWork(runLogKey, runLogWork)
 
       /** 一次程序里可能调很多次，序号让会话日志里的子调用 id 各不相同。 */
       let dispatches = 0
@@ -459,10 +460,10 @@ export function createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget
         const flight = lane.then(() => {
           runController.signal.throwIfAborted()
           return invokeTool({ ctx, name, args: rawArgs ?? {}, exec, callIdSuffix,
-            resolveSchema, executeNested, signal: runController.signal, scopeTarget,
-            // call_tool 的外层只是转发：内层 invokeTool 会记真正被调的那个工具。
-            // 两层都记会让同一份结果在会话里出现两次（曾让一个会话涨到 892MB）。
-            log: name !== CALL_TOOL })
+            resolveSchema, executeNested, signal: runController.signal, scopeTarget, runLogWork,
+            // 外层节点拥有真实的审批与校验结果，内层还以它作为 parent。
+            // 保留节点但仅记录成功摘要，正文只在内层留一份；外层失败仍可追踪。
+            log: name === CALL_TOOL ? 'summary' : true })
         })
         // 某次失败由它自己的绑定 promise 传给程序，不堵住 try/catch 后的新调用。
         lane = flight.then(() => undefined, () => undefined)
@@ -509,6 +510,13 @@ export function createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget
           ...(policy === undefined ? {} : { sandboxPolicy: policy }),
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         }))
+        // 新版运行时改用保留换行的 output 片段；旧安装版仍返回 logs 行。
+        // 明确转换协议，不把缺失字段以 undefined 放进工具的 JSON 输出。
+        if (result.output !== undefined) {
+          result.logs = [result.output.filter(block => block.type === 'text').map(block => block.text).join('')]
+          const images = result.output.filter(block => block.type === 'image')
+          if (images.length > 0) deliverContext(exec, { role: 'user', content: images })
+        }
         // 程序失败是 resolve 出来的**字段**，不是 run 的 reject。呈现它是调用方的事。
         // 形状与官方一致：带 kind 的文本 + 捕获到的 logs + 沙箱事实。
         if (result.error !== undefined) {
@@ -526,7 +534,7 @@ export function createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget
         runController.abort('call_tools 结束')
         await Promise.allSettled([...flights])
         // 子调用先收尾，再等它们登记的日志写完 —— 事件顺序才与调用顺序一致。
-        await closeRunLogWork(rootCallId)
+        await closeRunLogWork(runLogKey, runLogWork)
         exec.signal.removeEventListener('abort', onOuterAbort)
         activeRuns.delete(runController)
         finishRun()

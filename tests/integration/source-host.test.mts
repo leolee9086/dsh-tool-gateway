@@ -79,11 +79,12 @@ async function boot(t, { runtime = false, gatewayConfig = {}, ptc = false } = {}
   const agent = await ctx.agentLoop.create(SessionId('gateway-a'), { provider: 'scripted', model: 'fixture' })
   const other = await ctx.agentLoop.create(SessionId('gateway-b'), { provider: 'scripted', model: 'fixture' })
   const base = `http://127.0.0.1:${ctx.webServer.port}`
-  // Exercise production authentication over actual HTTP requests and responses.
-  ctx.webServer.register({ kind: 'exact', path: '/', handler: (req, res) => {
-    if (ctx.connection.authorizeIndex(req, res)) { res.writeHead(200); res.end('fixture') }
-  } })
-  const login = await fetch(ctx.connection.authenticatedUrl(base + '/'), { redirect: 'manual' })
+  // 使用独立认证插件的真实HTTP交换；不读取任何安装环境凭据。
+  await ctx.loader.root.create({ id: 'token-auth', name: '@deepseek-ai/dsh-host-authentication-token' })
+  await ctx.loader.await()
+  const { BrowserAuth } = await import(pathToFileURL(resolve(checkout, 'packages/host/authentication-token/src/browser-auth.ts')).href)
+  const auth = await BrowserAuth.create(ctx[Context.root], ctx.credentials, 30)
+  const login = await fetch(auth.authenticatedUrl(base + '/'), { redirect: 'manual' })
   assert.equal(login.status, 303)
   const cookie = login.headers.get('set-cookie')?.split(';')[0]
   assert.ok(cookie, 'actual connection service must issue cookie')
@@ -359,6 +360,17 @@ test('real SDK: current directory, bindings, validation, errors, timeout and nes
   assert.notEqual(logs[0].data.subCallId, logs[1].data.subCallId)
   assert.equal(logs[0].data.rootCallId, logs[1].data.rootCallId)
   assert.equal(logs[0].data.isError, false)
+  const dispatches = agent.session.snapshotEvents().filter(event => event.type === 'tool/ptc-dispatch')
+  for (const child of logs) {
+    const parent = dispatches.find(event => event.data.subCallId === child.data.parentCallId)
+    assert.ok(parent, 'nested dispatch must retain its parent node')
+    assert.equal(parent.data.name, 'call_tool')
+    assert.deepEqual(parent.data.content, [{ type: 'text', text: '工具转发成功；完整结果见子调用。' }])
+  }
+  await turn(agent, program('try { await tools.call_tool({tool_name:"missing_tool",arguments:{}}) } catch(e) { return e.message }'), done)
+  const rejected = agent.session.snapshotEvents().filter(event => event.type === 'tool/ptc-dispatch' && event.data.name === 'call_tool').at(-1)
+  assert.equal(rejected.data.isError, true, 'outer failure must remain observable')
+  assert.ok(rejected.data.content.some(block => block.type === 'text' && block.text.length > 0))
   await turn(agent, call('find_tools', { names: ['probe'], detail: 'full' }), done)
   assert.match(resultText(agent), /parameters|schema/)
   assert.match(resultText(agent), /probe/)
