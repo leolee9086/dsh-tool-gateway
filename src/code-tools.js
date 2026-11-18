@@ -23,7 +23,7 @@
  * 两个绑定按 exclusive 规则顺序结算，保留宿主审批、守卫、沙箱与结果处理。
  */
 import { deliverContext } from './deliver-context.js'
-import { CALL_TOOL, FIND_TOOLS, invokeTool } from './meta-tools.js'
+import { CALL_TOOL, FIND_TOOLS, closeRunLogWork, invokeTool, openRunLogWork } from './meta-tools.js'
 
 /** 第三个元工具的名字。host.js 用它拼白名单，也用它判断要不要挂。 */
 export const CALL_TOOLS = 'call_tools'
@@ -247,7 +247,7 @@ async function approveEscalation(request, approval) {
  *   按名字取工具 schema，转交给 invokeTool —— 派发出去的那一跳要带上它（见 meta-tools.js）
  * @returns {object[]} 一个工具定义
  */
-export function createCodeTools({ ctx, resolveSchema, executeNested }) {
+export function createCodeTools({ ctx, resolveSchema, executeNested, scopeTarget }) {
   /** 读运行时，读不到就返回 undefined。schema 投影时只能这么读 —— 不能抛。 */
   const peekRuntime = () => ctx.get('ptcRuntime')
 
@@ -443,6 +443,11 @@ export function createCodeTools({ ctx, resolveSchema, executeNested }) {
       // 日志会落在这次调用之后，看上去像是下一轮发生的事。
       const flights = new Set()
 
+      // 本次运行的日志账本：子调用的 dispatch 日志会被登记在这里，程序结束统一
+      // drain。它们不阻塞 bindings 的 promise —— 程序拿值不该等 spill 写盘。
+      const rootCallId = exec.rootCallId ?? exec.callId
+      openRunLogWork(rootCallId)
+
       /** 一次程序里可能调很多次，序号让会话日志里的子调用 id 各不相同。 */
       let dispatches = 0
       // 两个元工具都没有声明 isConcurrencySafe：按宿主默认规则作为 exclusive
@@ -454,7 +459,10 @@ export function createCodeTools({ ctx, resolveSchema, executeNested }) {
         const flight = lane.then(() => {
           runController.signal.throwIfAborted()
           return invokeTool({ ctx, name, args: rawArgs ?? {}, exec, callIdSuffix,
-            resolveSchema, executeNested, signal: runController.signal })
+            resolveSchema, executeNested, signal: runController.signal, scopeTarget,
+            // call_tool 的外层只是转发：内层 invokeTool 会记真正被调的那个工具。
+            // 两层都记会让同一份结果在会话里出现两次（曾让一个会话涨到 892MB）。
+            log: name !== CALL_TOOL })
         })
         // 某次失败由它自己的绑定 promise 传给程序，不堵住 try/catch 后的新调用。
         lane = flight.then(() => undefined, () => undefined)
@@ -517,6 +525,8 @@ export function createCodeTools({ ctx, resolveSchema, executeNested }) {
       } finally {
         runController.abort('call_tools 结束')
         await Promise.allSettled([...flights])
+        // 子调用先收尾，再等它们登记的日志写完 —— 事件顺序才与调用顺序一致。
+        await closeRunLogWork(rootCallId)
         exec.signal.removeEventListener('abort', onOuterAbort)
         activeRuns.delete(runController)
         finishRun()

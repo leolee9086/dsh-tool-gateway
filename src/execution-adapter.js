@@ -16,6 +16,28 @@ export async function importHostToolsModule(ctx, specifier) {
 }
 
 /**
+ * 解析宿主 scope 模块里的 scopeTarget。
+ *
+ * `tools/ptc-dispatch-log` 是一个按作用域路由的 waterfall：官方 PTC 用
+ * `scopeTarget(tools, dispatch.agent)` 构造接收者。插件自带一份 dsh-scope 会让
+ * 监听器落到另一个身份上，等于没有挂上 —— 所以和 dsh-tools 一样从宿主加载树取。
+ *
+ * @param {object} ctx 插件上下文
+ * @returns {Promise<(base: object, key: object|undefined) => object>} 宿主的 scopeTarget
+ */
+export async function importScopeTarget(ctx) {
+  try {
+    const scope = await importHostToolsModule(ctx, '@deepseek-ai/dsh-scope')
+    if (typeof scope?.scopeTarget !== 'function') return undefined
+    return scope.scopeTarget
+  } catch (error) {
+    // 旧宿主与测试桩没有跨模块加载树：日志副本退回原文，这是设计内的降级，
+    // 不是需要人处理的错误。这里不告警，免得每次装配都刷一条没有动作可做的日志。
+    return undefined
+  }
+}
+
+/**
  * 从 tools 服务的加载树取得同一份宿主模块。插件自身不安装另一份 Harness。
  * 只在新版调用公开 pipeline 子入口；旧宿主不需要也不会解析这个入口。
  * @param {object} ctx 插件上下文

@@ -222,6 +222,10 @@ if (gateway !== undefined) {
 
 旧版子调用走 `ctx.tools.execute()`；新版从 tools 服务所属 Loader 导入同一宿主的公开 `ToolExecutionPipeline`，执行 prepare、dispatch、complete，继承真实 parent、toolSet、signal 和目标 schema。审批、守卫、沙箱、条件准入、上下文及终止回合信号均保留。插件不安装第二份 Harness，不合并全局目录绕过作用域。
 
+子调用的**日志副本**走宿主的 `tools/ptc-dispatch-log` 瀑布（scopeTarget 同样从宿主加载树取）。`tool/ptc-dispatch` 事件里的 `content` 只给日志看：监听者（例如宿主的 spill 策略）可以把它换成预览 + spill 文件路径，程序拿到的值和模型看到的结果都不受影响。监听器抛错就回退原文，不让一次记录失败毁掉工具调用。这条日志任务是异步登记、随运行结束统一 drain 的 —— 程序拿值不该等 spill 写盘。
+
+**这套机制不是可选的。** 曾经绕过它：日志副本原样落盘，同一份结果还被双层绑定记了两遍，一个会话的 `tool/ptc-dispatch` 累计到 892MB，宿主加载时堆到 3.7GB 后 OOM。
+
 ### 文件
 
 | 文件 | 职责 |
@@ -233,6 +237,7 @@ if (gateway !== undefined) {
 | `src/gateway.js` | 可见性过滤、执行守卫（**硬禁用先判**）、提示段落，都按 `keepFor(agent)` / `enabledFor(agent)` 分支 |
 | `src/groups.js` | 工具组名册，以及「这个工具此刻能不能用」的三态判定（纯函数，不认识 Cordis） |
 | `src/ban.js` | 硬禁用名单：静态名单的判定 + 按 agent 抹掉模型可见工具表（原 dsh-tool-ban） |
+| `src/execution-adapter.js` | 从宿主加载树取同一份 `dsh-tools` 与 `dsh-scope`：执行流水线与日志副本瀑布的路由 |
 | `src/deliver-context.js` | 子调用带回来的非文本内容（图片等）怎么送到模型眼前 |
 | `src/session-key.js` | 一个 agent 的开关记在哪个会话名下（子代理跟随父） |
 | `src/switch-state.js` | 会话偏好的读写与持久化：总开关 + 三态工具名单 + 组覆盖（同一个会话的写入串行） |
@@ -301,6 +306,9 @@ if (gateway !== undefined) {
   这不是限制调用（子调用走的还是注册表的公开执行入口，审批、守卫、沙箱一样不少），
   而是**不让工具目录再被喂回模型**：官方 PTC 的 SDK 段落会列出全部工具的签名，
   我们这段只有两行。
+- **一层调用只记一条子调用日志。** `call_tools` 里的 `tools.call_tool(...)` 要过两层：
+  外层 `call_tool` 绑定只是转发，它不记事件；记的是内层真正被调的那个工具（名字也是它）。
+  两层都记会让同一份结果在会话里出现两次。
 - **程序结束就中止还在飞的子调用。** 程序写了 `tools.call_tool(...)` 却没 `await`，
   那个调用不会在结果返回之后继续跑下去 —— 它会随这次运行一起停掉，而且会等它
   收完尾才把结果交出去（不等的话，它的会话日志会落在这次调用之后）。
